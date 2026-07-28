@@ -134,14 +134,18 @@ Build mode is pinned per golden-rules §2:
   "command": "python3 /opt/simple-workflow/scripts/fetch_study_documents.py",
   "dockerfile": "simple-workflow/Dockerfile",
   "repo": "https://github.com/vedhav/simple-mediforce.git",
-  "commit": "0000000000000000000000000000000000000000",
+  "commit": "3b649d0e60624f044f1704f78c139637fac457ea",
   "timeoutMinutes": 10
 }
 ```
 
-**Pinning state: UNPINNED** — `commit` is the all-zeros sentinel. It is
-format-valid so schema validation passes, but no image can build from it. The
-package is not production-ready until it holds a real commit SHA.
+**Pinning state: pinned to
+`https://github.com/vedhav/simple-mediforce.git`@`3b649d0e60624f044f1704f78c139637fac457ea`.**
+
+That commit is the one whose `simple-workflow/` tree the image builds from. It
+stays reachable as an ancestor of `main` as HEAD moves on, so the build SHA is
+allowed to lag HEAD — it does not need to be re-pinned for unrelated changes,
+only when `Dockerfile` or `scripts/` change.
 
 `dockerfile` is repo-root-relative; the build context is that file's own
 directory, so `COPY scripts/` resolves to `simple-workflow/scripts/`. Do not

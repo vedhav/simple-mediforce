@@ -3,8 +3,8 @@
     {
       "name": "simple-workflow",
       "path": "simple-workflow/src/simple-workflow.wd.json",
-      "description": "Pick one NCT id from a fixed list of five studies; single human step.",
-      "tags": ["clinical", "starter"]
+      "description": "Pick one NCT id from a fixed list of five studies, then download every document that study has posted.",
+      "tags": ["clinical", "starter", "clinicaltrials-gov"]
     }
   ]
 }

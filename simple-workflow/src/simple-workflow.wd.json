@@ -91,7 +91,7 @@
     {
       "id": "review-usdm",
       "name": "Review USDM Metadata",
-      "type": "review",
+      "type": "decision",
       "executor": "human",
       "allowedRoles": ["operator"],
       "description": "Review the extracted USDM metadata. Start with the schedule-of-activities table rendered above the form: its gap panel lists everything the source did not state, and every amber \"?\" cell is a hole in the extraction rather than a procedure that does not happen. Then read usdm-summary.md and spot-check usdm.json against usdm-provenance.json — every title, phase, arm, epoch, objective, endpoint and eligibility criterion carries a source file and page number. Check the `unresolved` list in the Generate USDM Metadata output for what the agent could not find. Approve to finish, or request changes to send the run back to Generate USDM Metadata with your comment.",

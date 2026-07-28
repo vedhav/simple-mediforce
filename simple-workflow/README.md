@@ -478,7 +478,7 @@ Build mode is pinned per golden-rules §2:
 ```
 
 **Pinning state: both script steps pinned to
-`https://github.com/vedhav/simple-mediforce.git`@`003c8cec48c59209adfad7c9826bc97bce554715`.**
+`https://github.com/vedhav/simple-mediforce.git`@`87c02753c7db5b6cd3aa0eb0e0252ef1eb8c39c3`.**
 
 That commit is the one whose `simple-workflow/` tree the image builds from — the
 one that added `render_soa.py`. It

@@ -216,12 +216,18 @@ eligibilityCriteria, studyInterventions), the schedule of activities
 out of scope.
 
 The schedule of activities is **required**, not best-effort, because
-`render-soa` draws it. The prompt's rule is that an unreadable part is left out
-*whole* rather than partly guessed: no `ScheduledActivityInstance` for an
-illegible visit column, no mention in any `activityIds` for an illegible
-activity row, and an `unresolved` entry either way. That makes the omission
-render as UNKNOWN instead of as a confident blank — see
-[`render-soa`](#render-soa) for how the renderer reads it.
+`render-soa` draws it. Two rules govern it:
+
+- **Enumerate every SoA table first** (prompt §6a). Report the count as
+  `soaTablesFound` and model each table as its own `scheduleTimeline` named
+  after the protocol's own wording. `render-soa` checks that count against the
+  timelines actually emitted — see
+  [`soaTablesFound`](#soatablesfound--the-check-for-a-table-that-was-never-extracted).
+- **An unreadable part is left out whole, never partly guessed** (§6b): no
+  `ScheduledActivityInstance` for an illegible visit column, no mention in any
+  `activityIds` for an illegible activity row, and an `unresolved` entry either
+  way. That makes the omission render as UNKNOWN instead of as a confident
+  blank.
 
 The prompt forbids inventing content: anything the protocol does not state
 becomes `null` plus an `unresolved` entry, and a CDISC CT code the agent is not
@@ -266,6 +272,36 @@ when the evidence for it exists:
 An unreferenced encounter makes its whole column unknown; an unreferenced
 activity makes its whole row unknown. Both are reported in `gaps`.
 
+#### One table per schedule timeline
+
+Each `scheduleTimeline` is rendered as its own table, never merged. Protocols
+routinely carry several SoA tables — one per cycle, or one per regimen — and
+`NCT04822298` carries four (`Table 1-1`, `1-2`, `1-3` for three Cycle 1 regimens
+plus `Table 1-4` for Cycle 2 and beyond). Merged into one grid, visits from
+schedules that are alternatives to one another sit side by side as though they
+were one schedule.
+
+Within a table the columns are the visits *that* timeline schedules, plus any
+visit no timeline schedules at all (those belong to every table equally as far
+as a reader can tell, and render as unknown columns). Rows are always every
+activity in the design, so rows line up across tables; an activity belonging to
+a different schedule renders unknown there rather than absent, with one summary
+gap per table rather than one gap per activity.
+
+#### `soaTablesFound` — the check for a table that was never extracted
+
+This is the one gap the renderer cannot find on its own: if the extraction step
+models one SoA table out of four, **nothing in the USDM records that the other
+three existed**, and the report draws a complete-looking table and declares no
+gaps. That is exactly what the first real run did.
+
+So `generate-usdm` must report `soaTablesFound` — how many SoA tables the source
+documents contain — and `render-soa` compares it against the number of timelines
+actually modelled. A shortfall becomes a prominent gap naming the count; an
+absent `soaTablesFound` is itself a gap, because silence is indistinguishable
+from "there was only one". Both appear in `result.json` as `soaTablesFound` and
+`soaTablesModelled`.
+
 Everything else the renderer could not resolve lands in `gaps[]` and in a panel
 above the table: missing names, visits with no resolvable `scheduledAtId`, a
 `previousId`/`nextId` chain that is not one consistent chain (the table then
@@ -282,9 +318,14 @@ own panel.
   "usdmSource": "/workspace/usdm/usdm.json",
   "tableRendered": true,
   "soaComplete": false,
-  "designs": [{ "id": "StudyDesign_1", "label": "…", "activities": 20, "encounters": 11,
-                "scheduled": 80, "notScheduled": 90, "unknown": 50, "danglingReferences": 0 }],
-  "gapCount": 5,
+  "soaTablesFound": 4,
+  "soaTablesModelled": 1,
+  "designs": [{ "id": "StudyDesign_1", "label": "…", "activities": 17, "encounters": 12,
+                "scheduled": 108, "notScheduled": 96, "unknown": 0,
+                "schedules": [{ "label": "AMG 160 Cycle 2+ Schedule of Activities", "activities": 17,
+                                "encounters": 12, "scheduled": 108, "notScheduled": 96, "unknown": 0 }],
+                "danglingReferences": 0 }],
+  "gapCount": 1,
   "gaps": [{ "severity": "missing", "scope": "studyDesigns[0].activities[14]",
              "message": "no scheduled activity instance references activity 'PK blood sample', so its whole row is unknown rather than empty" }],
   "danglingReferences": [],

@@ -271,35 +271,21 @@ def order_by_chain(
     return ordered, True
 
 
-def collect_instances(design: dict, gaps: Gaps, scope: str) -> list[dict]:
-    """Every ScheduledActivityInstance across the design's schedule timelines."""
-    timelines = as_list(design.get("scheduleTimelines"))
-    if not timelines:
-        gaps.missing(
-            scope,
-            "no scheduleTimelines — USDM carries the activity-to-visit pairings here, so "
-            "every cell below is unknown rather than empty",
-        )
-        return []
+def timeline_instances(timeline: dict) -> list[dict]:
+    """The ScheduledActivityInstances of one timeline.
 
-    instances: list[dict] = []
-    for timeline in timelines:
-        timeline_dict = as_dict(timeline)
-        for instance in as_list(timeline_dict.get("instances")):
-            instance_dict = as_dict(instance)
-            instance_type = instance_dict.get("instanceType")
-            # Decision instances carry no activities; only activity instances
-            # contribute cells.
-            if isinstance(instance_type, str) and instance_type != "ScheduledActivityInstance":
-                continue
-            instances.append(instance_dict)
-
-    if not instances:
-        gaps.missing(
-            scope,
-            f"{len(timelines)} scheduleTimeline(s) declared but none contains a "
-            "ScheduledActivityInstance — every cell below is unknown rather than empty",
-        )
+    Decision instances carry no activities, so only activity instances
+    contribute cells. An instance with no `instanceType` is included — being
+    lenient here is right, since the alternative is silently dropping schedule
+    data over a missing discriminator.
+    """
+    instances = []
+    for instance in as_list(timeline.get("instances")):
+        instance_dict = as_dict(instance)
+        instance_type = instance_dict.get("instanceType")
+        if isinstance(instance_type, str) and instance_type != "ScheduledActivityInstance":
+            continue
+        instances.append(instance_dict)
     return instances
 
 
@@ -346,9 +332,7 @@ def build_design(design: dict, index: int, gaps: Gaps) -> dict:
     activities, _ = order_by_chain(activities, gaps, f"{scope}.activities", "activity")
     encounters, _ = order_by_chain(encounters, gaps, f"{scope}.encounters", "encounter")
 
-    instances = collect_instances(design, gaps, f"{scope}.scheduleTimelines")
     timings = collect_timings(design)
-
     activity_ids = {entity["id"] for entity in activities if isinstance(entity.get("id"), str)}
     encounter_ids = {entity["id"] for entity in encounters if isinstance(entity.get("id"), str)}
 
@@ -358,28 +342,152 @@ def build_design(design: dict, index: int, gaps: Gaps) -> dict:
         if isinstance(as_dict(epoch).get("id"), str)
     }
 
-    scheduled: set[tuple[str, str]] = set()
-    encounters_with_data: set[str] = set()
-    activities_with_data: set[str] = set()
-    epoch_of_encounter: dict[str, str] = {}
+    # Name and describe every activity once, so the gaps that belong to the
+    # activity itself are raised once rather than once per table.
+    rows_meta = []
+    for position, activity in enumerate(activities):
+        activity_id = activity.get("id") if isinstance(activity.get("id"), str) else None
+        label, synthesised = display_name(activity, activity_id)
+        if synthesised:
+            gaps.missing(f"{scope}.activities[{position}]", "the activity has no name or label")
+        children = [child for child in as_list(activity.get("childIds")) if isinstance(child, str)]
+        if children:
+            gaps.ambiguous(
+                f"{scope}.activities[{position}]",
+                f"activity '{label}' declares {len(children)} child activity(ies); the table is "
+                "flat, so the grouping is not shown",
+            )
+        rows_meta.append({
+            "id": activity_id,
+            "label": label,
+            "description": activity.get("description") if isinstance(activity.get("description"), str) else None,
+        })
+
+    # One table per schedule timeline. A protocol with a Cycle 1 schedule and a
+    # Cycle 2-and-beyond schedule — or with alternative schedules per regimen —
+    # models each as its own timeline, and merging them into a single grid would
+    # place visits from mutually exclusive schedules side by side as though they
+    # were one. Each timeline therefore gets its own table.
+    timelines = [as_dict(entity) for entity in as_list(design.get("scheduleTimelines"))]
     dangling: list[dict] = []
-    instances_without_encounter = 0
+    scheduling = [
+        read_timeline(timeline, index, activity_ids, encounter_ids, scope, gaps, dangling)
+        for index, timeline in enumerate(timelines)
+    ]
+
+    for reference in dangling:
+        gaps.ambiguous(
+            reference["from"],
+            f"{reference['field']} points at '{reference['value']}', which is not declared in this design",
+        )
+
+    if not timelines:
+        gaps.missing(
+            f"{scope}.scheduleTimelines",
+            "no scheduleTimelines — USDM carries the activity-to-visit pairings here, so "
+            "every cell below is unknown rather than empty",
+        )
+    elif not any(entry["instances"] for entry in scheduling):
+        gaps.missing(
+            f"{scope}.scheduleTimelines",
+            f"{len(timelines)} scheduleTimeline(s) declared but none contains a "
+            "ScheduledActivityInstance — every cell below is unknown rather than empty",
+        )
+
+    # A visit no timeline schedules anything at is a gap on the design, not on
+    # any one table, so it is reported once and shown as an unknown column in
+    # every table (a visit that belongs to no schedule belongs to all of them
+    # equally as far as the reader can tell).
+    encounters_anywhere = set().union(*(entry["encounters"] for entry in scheduling)) if scheduling else set()
+    orphan_encounter_ids = set()
+    for position, encounter in enumerate(encounters):
+        encounter_id = encounter.get("id") if isinstance(encounter.get("id"), str) else None
+        label, synthesised = display_name(encounter, encounter_id)
+        if synthesised:
+            gaps.missing(f"{scope}.encounters[{position}]", "the visit has no name or label")
+        if encounter_timing(encounter, timings) is None:
+            gaps.missing(
+                f"{scope}.encounters[{position}]",
+                f"visit '{label}' has no stated timing (no resolvable scheduledAtId)",
+            )
+        if encounter_id and encounter_id not in encounters_anywhere:
+            orphan_encounter_ids.add(encounter_id)
+            gaps.missing(
+                f"{scope}.encounters[{position}]",
+                f"no scheduled activity instance in any timeline references visit '{label}', so "
+                "its whole column is unknown rather than empty",
+            )
+
+    if not scheduling:
+        scheduling = [EMPTY_SCHEDULING]
+    tables = [
+        build_table(entry, rows_meta, encounters, timings, epochs_by_id, orphan_encounter_ids,
+                    len(scheduling), scope, gaps)
+        for entry in scheduling
+    ]
+
+    return {
+        "id": design_id,
+        "label": design_label,
+        "tables": tables,
+        "dangling": dangling,
+        "timelineCount": len(timelines),
+        "counts": {
+            "activities": len(rows_meta),
+            "encounters": len(encounters),
+            "scheduled": sum(table["counts"]["scheduled"] for table in tables),
+            "notScheduled": sum(table["counts"]["notScheduled"] for table in tables),
+            "unknown": sum(table["counts"]["unknown"] for table in tables),
+        },
+    }
+
+
+# The stand-in when a design declares no timeline at all: one table, every cell
+# unknown. `hasTimeline` is what stops any cell claiming "not scheduled".
+EMPTY_SCHEDULING: dict = {
+    "id": None, "label": "Schedule not stated", "hasTimeline": False,
+    "instances": [], "encounters": set(), "activities": set(),
+    "scheduled": set(), "epochOfEncounter": {},
+}
+
+
+def read_timeline(
+    timeline: dict,
+    index: int,
+    activity_ids: set[str],
+    encounter_ids: set[str],
+    design_scope: str,
+    gaps: Gaps,
+    dangling: list[dict],
+) -> dict:
+    """Resolve one timeline's instances into the sets the cell states are read from."""
+    timeline_id = timeline.get("id") if isinstance(timeline.get("id"), str) else None
+    label, _ = display_name(timeline, timeline_id or f"ScheduleTimeline_{index + 1}")
+    scope = f"{design_scope}.scheduleTimelines[{index}]"
+    instances = timeline_instances(timeline)
+
+    scheduled: set[tuple[str, str]] = set()
+    encounters_covered: set[str] = set()
+    activities_covered: set[str] = set()
+    epoch_of_encounter: dict[str, str] = {}
+    without_encounter = 0
 
     for instance in instances:
         instance_id = instance.get("id") if isinstance(instance.get("id"), str) else "<no id>"
         encounter_id = instance.get("encounterId")
 
         if not isinstance(encounter_id, str) or encounter_id == "":
-            instances_without_encounter += 1
+            without_encounter += 1
+            encounter_id = None
         elif encounter_id not in encounter_ids:
             dangling.append({
-                "from": f"{scope}.scheduleTimelines instance {instance_id}",
+                "from": f"{scope} instance {instance_id}",
                 "field": "encounterId",
                 "value": encounter_id,
             })
             encounter_id = None
         else:
-            encounters_with_data.add(encounter_id)
+            encounters_covered.add(encounter_id)
             epoch_id = instance.get("epochId")
             if isinstance(epoch_id, str) and epoch_id != "":
                 epoch_of_encounter.setdefault(encounter_id, epoch_id)
@@ -389,7 +497,7 @@ def build_design(design: dict, index: int, gaps: Gaps) -> dict:
                 continue
             if activity_id not in activity_ids:
                 dangling.append({
-                    "from": f"{scope}.scheduleTimelines instance {instance_id}",
+                    "from": f"{scope} instance {instance_id}",
                     "field": "activityIds",
                     "value": activity_id,
                 })
@@ -400,130 +508,125 @@ def build_design(design: dict, index: int, gaps: Gaps) -> dict:
             # as "covered" would license a "not scheduled" verdict in every
             # other column on the strength of a reference we could not resolve.
             if isinstance(encounter_id, str):
-                activities_with_data.add(activity_id)
+                activities_covered.add(activity_id)
                 scheduled.add((activity_id, encounter_id))
 
-    if instances_without_encounter > 0:
+    if without_encounter > 0:
         gaps.missing(
-            f"{scope}.scheduleTimelines",
-            f"{instances_without_encounter} scheduled activity instance(s) name no encounter, so "
-            "their activities could not be placed in any visit column",
-        )
-    for reference in dangling:
-        gaps.ambiguous(
-            reference["from"],
-            f"{reference['field']} points at '{reference['value']}', which is not declared in this design",
+            scope,
+            f"{without_encounter} scheduled activity instance(s) in '{label}' name no encounter, "
+            "so their activities could not be placed in any visit column",
         )
 
-    # Columns.
+    return {
+        "id": timeline_id,
+        "label": label,
+        "hasTimeline": True,
+        "instances": instances,
+        "encounters": encounters_covered,
+        "activities": activities_covered,
+        "scheduled": scheduled,
+        "epochOfEncounter": epoch_of_encounter,
+    }
+
+
+def build_table(
+    scheduling: dict,
+    rows_meta: list[dict],
+    encounters: list[dict],
+    timings: dict[str, dict],
+    epochs_by_id: dict[str, dict],
+    orphan_encounter_ids: set[str],
+    table_count: int,
+    design_scope: str,
+    gaps: Gaps,
+) -> dict:
+    """Build one rendered table from one timeline's scheduling data."""
+    scope = f"{design_scope} schedule '{scheduling['label']}'"
+
     columns: list[dict] = []
-    for position, encounter in enumerate(encounters):
+    for encounter in encounters:
         encounter_id = encounter.get("id") if isinstance(encounter.get("id"), str) else None
-        label, synthesised = display_name(encounter, encounter_id)
-        if synthesised:
-            gaps.missing(f"{scope}.encounters[{position}]", "the visit has no name or label")
-
-        timing = encounter_timing(encounter, timings)
-        if timing is None:
-            gaps.missing(
-                f"{scope}.encounters[{position}]",
-                f"visit '{label}' has no stated timing (no resolvable scheduledAtId)",
-            )
-
-        has_data = encounter_id in encounters_with_data if encounter_id else False
-        if encounter_id and not has_data:
-            gaps.missing(
-                f"{scope}.encounters[{position}]",
-                f"no scheduled activity instance references visit '{label}', so its whole "
-                "column is unknown rather than empty",
-            )
-
-        epoch_id = epoch_of_encounter.get(encounter_id) if encounter_id else None
+        # Visits belonging to a *different* schedule are not this schedule's
+        # columns. Visits belonging to no schedule are shown in every table,
+        # since nothing says which one they belong to.
+        if encounter_id is not None and encounter_id not in scheduling["encounters"]:
+            if encounter_id not in orphan_encounter_ids:
+                continue
+        label, _ = display_name(encounter, encounter_id)
+        has_data = encounter_id in scheduling["encounters"] if encounter_id else False
+        epoch_id = scheduling["epochOfEncounter"].get(encounter_id) if encounter_id else None
         epoch = epochs_by_id.get(epoch_id) if epoch_id else None
-        epoch_label = display_name(epoch, epoch_id)[0] if epoch else None
-        # The grouping header will read "epoch not stated" for this column, so the
-        # gap list has to name it too — a visible hole with no entry in the list
-        # reads as a rendering quirk rather than as missing source data. When no
-        # visit at all has an epoch, the one bulk gap below says it instead of
-        # repeating this per column.
-        if epoch_label is None and epochs_by_id and epoch_of_encounter:
-            gaps.missing(
-                f"{scope}.encounters[{position}]",
-                f"visit '{label}' is not assigned to an epoch by any scheduled activity "
-                "instance, so it is grouped under 'epoch not stated'",
-            )
-
         columns.append({
             "id": encounter_id,
             "label": label,
-            "timing": timing,
+            "timing": encounter_timing(encounter, timings),
             "type": code_decode(encounter.get("type")),
             "hasData": has_data,
-            "epochLabel": epoch_label,
+            "epochLabel": display_name(epoch, epoch_id)[0] if epoch else None,
         })
 
-    if epochs_by_id and not epoch_of_encounter:
+    if scheduling["hasTimeline"] and epochs_by_id and not scheduling["epochOfEncounter"]:
         gaps.missing(
-            f"{scope}.scheduleTimelines",
-            f"{len(epochs_by_id)} epoch(s) are declared but no scheduled activity instance "
-            "names one, so the visits could not be grouped by epoch",
+            scope,
+            f"{len(epochs_by_id)} epoch(s) are declared but no scheduled activity instance in "
+            "this schedule names one, so its visits could not be grouped by epoch",
+        )
+    for column in columns:
+        if column["epochLabel"] is None and epochs_by_id and scheduling["epochOfEncounter"] and column["hasData"]:
+            gaps.missing(
+                scope,
+                f"visit '{column['label']}' is not assigned to an epoch by any scheduled activity "
+                "instance, so it is grouped under 'epoch not stated'",
+            )
+
+    rows: list[dict] = []
+    outside = []
+    for meta in rows_meta:
+        activity_id = meta["id"]
+        has_data = activity_id in scheduling["activities"] if activity_id else False
+        if scheduling["hasTimeline"] and activity_id and not has_data:
+            outside.append(meta["label"])
+        rows.append({
+            **meta,
+            "hasData": has_data,
+            "cells": [
+                {
+                    "state": cell_state(activity_id, column, has_data, scheduling["scheduled"],
+                                        scheduling["hasTimeline"]),
+                    "column": column,
+                }
+                for column in columns
+            ],
+        })
+
+    if outside:
+        # Phrased differently depending on whether there is another schedule that
+        # could account for the activity: with one schedule this is a plain hole,
+        # with several it is usually an activity belonging to a different one.
+        elsewhere = (
+            "they may belong to one of the other schedules below, or may have been missed"
+            if table_count > 1
+            else "so their rows are unknown rather than empty"
+        )
+        gaps.missing(
+            scope,
+            f"{len(outside)} activity(ies) are not scheduled anywhere in this schedule "
+            f"({', '.join(outside[:6])}{', …' if len(outside) > 6 else ''}) — {elsewhere}; "
+            "their cells here are unknown, not blank",
         )
 
-    # Rows.
-    rows: list[dict] = []
-    for position, activity in enumerate(activities):
-        activity_id = activity.get("id") if isinstance(activity.get("id"), str) else None
-        label, synthesised = display_name(activity, activity_id)
-        if synthesised:
-            gaps.missing(f"{scope}.activities[{position}]", "the activity has no name or label")
-
-        children = [child for child in as_list(activity.get("childIds")) if isinstance(child, str)]
-        if children:
-            gaps.ambiguous(
-                f"{scope}.activities[{position}]",
-                f"activity '{label}' declares {len(children)} child activity(ies); the table is "
-                "flat, so the grouping is not shown",
-            )
-
-        has_data = activity_id in activities_with_data if activity_id else False
-        if activity_id and not has_data and instances:
-            gaps.missing(
-                f"{scope}.activities[{position}]",
-                f"no scheduled activity instance references activity '{label}', so its whole "
-                "row is unknown rather than empty",
-            )
-
-        cells: list[dict] = []
-        for column in columns:
-            cells.append({
-                "state": cell_state(activity_id, column, has_data, scheduled, bool(instances)),
-                "column": column,
-            })
-
-        rows.append({
-            "id": activity_id,
-            "label": label,
-            "description": activity.get("description") if isinstance(activity.get("description"), str) else None,
-            "hasData": has_data,
-            "cells": cells,
-        })
-
-    scheduled_count = sum(1 for row in rows for cell in row["cells"] if cell["state"] == SCHEDULED)
-    unknown_count = sum(1 for row in rows for cell in row["cells"] if cell["state"] == UNKNOWN)
-    not_scheduled_count = sum(1 for row in rows for cell in row["cells"] if cell["state"] == NOT_SCHEDULED)
-
     return {
-        "id": design_id,
-        "label": design_label,
+        "id": scheduling["id"],
+        "label": scheduling["label"],
         "rows": rows,
         "columns": columns,
-        "dangling": dangling,
         "counts": {
             "activities": len(rows),
             "encounters": len(columns),
-            "scheduled": scheduled_count,
-            "notScheduled": not_scheduled_count,
-            "unknown": unknown_count,
+            "scheduled": sum(1 for row in rows for cell in row["cells"] if cell["state"] == SCHEDULED),
+            "notScheduled": sum(1 for row in rows for cell in row["cells"] if cell["state"] == NOT_SCHEDULED),
+            "unknown": sum(1 for row in rows for cell in row["cells"] if cell["state"] == UNKNOWN),
         },
     }
 
@@ -604,13 +707,40 @@ def build_model(usdm: dict, usdm_path: Path, upstream: dict, gaps: Gaps) -> dict
         entry for entry in as_list(upstream.get("unresolved")) if isinstance(entry, dict)
     ]
 
+    designs_built = [build_design(design, index, gaps) for index, design in enumerate(designs)]
+
+    # A whole SoA table missing from the USDM is invisible to this renderer:
+    # nothing in the model records that the protocol had another one. So
+    # `generate-usdm` reports how many SoA tables it FOUND, and the count is
+    # checked against how many timelines it actually modelled. Without this, a
+    # protocol with four SoA tables of which one was extracted renders a
+    # confident, complete-looking table and a "no gaps" verdict.
+    found = upstream.get("soaTablesFound")
+    modelled = sum(design["timelineCount"] for design in designs_built)
+    if isinstance(found, int) and found > modelled:
+        gaps.missing(
+            "study.versions[0].studyDesigns[].scheduleTimelines",
+            f"the extraction step found {found} schedule-of-activities table(s) in the source "
+            f"documents but modelled only {modelled} — {found - modelled} whole table(s) are absent "
+            "from this report. What is drawn below is therefore incomplete, however complete it looks",
+        )
+    elif found is None:
+        gaps.missing(
+            "generate-usdm.soaTablesFound",
+            "the extraction step did not report how many schedule-of-activities tables the source "
+            "documents contain, so this report cannot tell whether a whole table is missing. "
+            "Protocols routinely carry several (one per cycle, or one per regimen)",
+        )
+
     return {
         "nctId": nct_id,
         "title": title_text,
         "phase": phase,
         "usdmVersion": usdm.get("usdmVersion") if isinstance(usdm.get("usdmVersion"), str) else None,
         "sourcePath": str(usdm_path),
-        "designs": [build_design(design, index, gaps) for index, design in enumerate(designs)],
+        "designs": designs_built,
+        "soaTablesFound": found if isinstance(found, int) else None,
+        "soaTablesModelled": modelled,
         "upstreamUnresolved": unresolved,
         "upstreamConfidence": upstream.get("confidence"),
     }
@@ -667,6 +797,11 @@ html.dark #soa-report {
 
 #soa-report h1 { font-size: 18px; margin: 0 0 2px; font-weight: 650; letter-spacing: -0.01em; }
 #soa-report h2 { font-size: 14px; margin: 22px 0 8px; font-weight: 620; }
+#soa-report h4 { font-size: 13px; margin: 0 0 6px; font-weight: 620; }
+.soa-table-title {
+  font-size: 12.5px !important; margin: 20px 0 8px !important; font-weight: 650 !important;
+  padding-left: 8px; border-left: 3px solid var(--soa-accent);
+}
 #soa-report h3 { font-size: 13px; margin: 0 0 6px; font-weight: 620; }
 #soa-report p { margin: 0 0 8px; }
 #soa-report code {
@@ -1009,7 +1144,6 @@ CELL_WORD = {SCHEDULED: "scheduled", NOT_SCHEDULED: "not scheduled", UNKNOWN: "n
 
 def render_design(design: dict) -> str:
     counts = design["counts"]
-    design_id = design["id"]
 
     if counts["activities"] == 0 or counts["encounters"] == 0:
         return (
@@ -1019,6 +1153,47 @@ def render_design(design: dict) -> str:
             f"<p>This design declares {counts['activities']} activity(ies) and "
             f"{counts['encounters']} visit(s). A schedule of activities needs at least one of each. "
             "Nothing is shown below because there is nothing to show — see the gaps above.</p></div>"
+        )
+
+    tables = design["tables"]
+    intro = ""
+    if len(tables) > 1:
+        names = ", ".join(f"<b>{esc(table['label'])}</b>" for table in tables)
+        intro = (
+            '<div class="soa-panel">'
+            f"<h3>{len(tables)} schedules in this design</h3>"
+            f"<p>This design declares {len(tables)} schedule timelines — {names} — and each is drawn "
+            "as its own table below. They are deliberately not merged: visits from schedules that are "
+            "alternatives to one another, or that apply to different cycles, would otherwise sit side "
+            "by side as though they belonged to one schedule. An activity belonging to a different "
+            "schedule shows as unknown here, not as absent.</p></div>"
+        )
+
+    return (
+        f'<h2>{esc(design["label"])}</h2>'
+        f"{render_dangling_panel(design)}{intro}"
+        + "".join(
+            render_table(table, f"{design['id']}--{index}", len(tables))
+            for index, table in enumerate(tables)
+        )
+    )
+
+
+def render_table(design: dict, design_id: str, table_count: int) -> str:
+    """Render one schedule timeline's table.
+
+    `design_id` is the per-table id the toolbar, counter and detail panel are
+    keyed on, so each table's controls only touch its own rows.
+    """
+    counts = design["counts"]
+    heading = f'<h3 class="soa-table-title">{esc(design["label"])}</h3>' if table_count > 1 else ""
+
+    if counts["encounters"] == 0:
+        return (
+            f"{heading}"
+            '<div class="soa-panel soa-bad"><h4>No visits in this schedule</h4>'
+            "<p>No visit could be placed in this schedule, so no table is drawn for it — see the "
+            "gaps above.</p></div>"
         )
 
     # The label is pinned to the exact pixel width of the columns it spans.
@@ -1086,8 +1261,7 @@ def render_design(design: dict) -> str:
             f'{"".join(cells)}<td class="soa-spacer"></td></tr>'
         )
 
-    return f"""<h2>{esc(design["label"])}</h2>
-{render_dangling_panel(design)}
+    return f"""{heading}
 <div class="soa-toolbar">
   <input type="search" data-soa="search" placeholder="Filter activities&hellip;" aria-label="Filter activities">
   <label class="soa-toggle" title="Activities never scheduled anywhere, or unknown at a visit that does have scheduling data. Excludes cells that are unknown only because their whole visit column has no data."><input type="checkbox" data-soa="only-gap-rows"> Only activities with their own gaps</label>
@@ -1212,6 +1386,9 @@ def main() -> None:
             "id": design["id"],
             "label": design["label"],
             **design["counts"],
+            "schedules": [
+                {"label": table["label"], **table["counts"]} for table in design["tables"]
+            ],
             "danglingReferences": len(design["dangling"]),
         }
         for design in model["designs"]
@@ -1230,6 +1407,8 @@ def main() -> None:
         "usdmSource": str(usdm_path),
         "tableRendered": renderable,
         "soaComplete": gaps.count() == 0 and unknown_total == 0 and renderable,
+        "soaTablesFound": model["soaTablesFound"],
+        "soaTablesModelled": model["soaTablesModelled"],
         "designs": designs,
         "gapCount": gaps.count(),
         "gaps": gaps.entries,

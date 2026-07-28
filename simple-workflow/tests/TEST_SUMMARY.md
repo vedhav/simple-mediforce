@@ -13,7 +13,7 @@ reports SKIP rather than FAIL. `test_render_soa.py` needs nothing.
 | Script | Status | Asserted |
 |--------|--------|----------|
 | `scripts/fetch_study_documents.py` | **tested** | Happy path against the live API using `tests/fixtures/fetch-documents.input.json` (`NCT04822298`): exit 0; `result.json` has `nctId`, `documentCount == len(documents)`, `documentCount > 0`, and `summary` naming the study; every document carries `filename`, `sourceFilename`, `sourceUrl`, `typeAbbrev`, `label`, `date`, `hasProtocol`, `hasSap`, `hasIcf`, `sizeBytes`; each file exists on disk, its on-disk size equals the reported `sizeBytes`, it starts with the `%PDF-` magic bytes, and its name is prefixed with the NCT id. Failure path: step input with no `nctId` exits 1 and reports the reason in `result.json`'s `error` field. |
-| `scripts/render_soa.py` | **tested** | 13 scenarios, each mutating one part of a complete in-test USDM fixture. See below. |
+| `scripts/render_soa.py` | **tested** | 17 scenarios, each mutating one part of a complete in-test USDM fixture. See below. |
 
 Last run: 2 passed, 0 skipped, 0 failed.
 
@@ -36,9 +36,30 @@ out `unknown` rather than `not-scheduled`, that the gap is named in
 | broken `previousId`/`nextId` chain | gap raised with severity `ambiguous`; the HTML says the shown order may not be the protocol's |
 | instances with no `epochId` | grouping header reads `epoch not stated`; one bulk gap rather than one per column |
 | no activities | exit 0; `tableRendered: false`; "No table could be drawn"; **no empty `<table>` rendered at all** |
+| `soaTablesFound: 4` but one timeline | `soaComplete: false` **even though every cell resolves**; the gap names "3 whole table(s) are absent"; the HTML warns the drawn table looks complete. This is the regression test for the real miss on `NCT04822298` — see below |
+| `soaTablesFound` absent | raised as its own gap, `soaComplete: false`; silence about the count is not treated as "there was only one" |
+| two timelines | two separate `<table>`s, each named after its timeline; the Cycle 1 visit is **not** a column of the main schedule; activities belonging to the other schedule are `unknown` there, not `not-scheduled`; the report explains why there are two |
 | upstream `unresolved[]` | `generate-usdm`'s own reason and path surfaced verbatim |
 | missing `usdm.json` | exit **1** — a broken upstream contract, unlike a data gap; `error` names the file; a worktree listing is attached for diagnosis; no report written |
 | injection in source text | `</script><img src=x onerror=…>` in an activity name never appears as markup, only as escaped text |
+
+## Verified against a real extraction
+
+Run `3a58fceb` (v5, `NCT04822298`) produced a 95 KB `usdm.json` with 17
+activities, 12 encounters, 5 epochs and one timeline of 12 instances with 12
+timings. The renderer was run against that file directly:
+
+- 17 × 12 = 204 cells, 108 scheduled, 96 not scheduled, 0 unknown; every
+  activity and visit named, every visit timed, chains consistent, all epochs
+  assigned. Visit names and timings match the protocol's Table 1-4.
+- **It reported `soaComplete: true` and zero gaps — and that was wrong.** The
+  protocol's SoA section carries four tables (`Table 1-1`/`1-2`/`1-3`, three
+  Cycle 1 regimens, plus `Table 1-4`, Cycle 2 and beyond), confirmed by
+  `pdftotext` on the source PDF. Cycle 1 is absent from the USDM entirely: the
+  visits jump from Screening straight to Cycle 2 Day 1.
+- That is what `soaTablesFound` exists for. Re-running the same real
+  `usdm.json` with an honest count of 4 now yields `soaComplete: false` and
+  `3 whole table(s) are absent from this report`.
 
 ## Verified by hand, not by the suite
 

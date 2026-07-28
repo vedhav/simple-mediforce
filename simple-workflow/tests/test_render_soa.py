@@ -125,7 +125,8 @@ def run(usdm: dict | None, upstream: dict | None = None) -> tuple[int, dict, str
         if usdm is not None:
             (workspace_dir / "usdm" / "usdm.json").write_text(json.dumps(usdm))
 
-        step_input = {"steps": {"generate-usdm": upstream or {"nctId": "NCT99999999"}}}
+        default_upstream = {"nctId": "NCT99999999", "soaTablesFound": 1}
+        step_input = {"steps": {"generate-usdm": upstream or default_upstream}}
         (output_dir / "input.json").write_text(json.dumps(step_input))
 
         env = {**os.environ, "MEDIFORCE_OUTPUT_DIR": str(output_dir), "MEDIFORCE_WORKSPACE_DIR": str(workspace_dir)}
@@ -369,10 +370,88 @@ def test_no_activities() -> None:
     check("no activities" in json.dumps(result.get("gaps", [])), "the gap names the empty activities")
 
 
+def test_missing_whole_soa_table_is_flagged() -> None:
+    print("── a whole SoA table the extraction skipped is flagged, not silently absent")
+    # The real failure this guards: NCT04822298's protocol has four SoA tables
+    # (three Cycle 1 regimens plus Cycle 2-and-beyond). An extraction that
+    # models one of them produces a table that looks complete, and nothing in
+    # the USDM records that the other three ever existed.
+    upstream = {"nctId": "NCT99999999", "soaTablesFound": 4}
+    exit_code, result, fragment, _ = run(complete_usdm(), upstream)
+
+    check(exit_code == 0, "exits 0")
+    check(result.get("soaTablesFound") == 4, "the reported source count is carried through")
+    check(result.get("soaTablesModelled") == 1, "the modelled count is 1")
+    check(result.get("soaComplete") is False, "soaComplete is false despite every cell resolving")
+    check(
+        any("3 whole table(s) are absent" in gap["message"] for gap in result.get("gaps", [])),
+        f"the shortfall is named in gaps: {result.get('gaps')}",
+    )
+    check("whole table(s) are absent" in fragment, "the report says so in words")
+    check("however complete it looks" in fragment, "and warns that the drawn table looks complete")
+
+
+def test_unreported_table_count_is_itself_a_gap() -> None:
+    print("── not reporting the SoA table count is a gap in its own right")
+    exit_code, result, fragment, _ = run(complete_usdm(), {"nctId": "NCT99999999"})
+
+    check(exit_code == 0, "exits 0")
+    check(result.get("soaTablesFound") is None, "the count is absent")
+    check(
+        any(gap["scope"] == "generate-usdm.soaTablesFound" for gap in result.get("gaps", [])),
+        f"the absent count is raised as a gap: {result.get('gaps')}",
+    )
+    check(result.get("soaComplete") is False, "so the schedule cannot be called complete")
+
+
+def test_multiple_timelines_render_as_separate_tables() -> None:
+    print("── two schedules render as two tables, never merged into one grid")
+    usdm = complete_usdm()
+    design = design_of(usdm)
+    # A Cycle 1 schedule over its own visit, alongside the existing schedule.
+    design["encounters"].append({
+        "id": "Encounter_C1", "name": "Cycle 1 Day 1", "type": code("Code_9", "Site Visit"),
+        "scheduledAtId": "Timing_C1", "previousId": "Encounter_3", "nextId": None,
+    })
+    design["encounters"][2]["nextId"] = "Encounter_C1"
+    design["scheduleTimelines"].append({
+        "id": "ScheduleTimeline_2", "name": "Cycle 1 Only", "mainTimeline": False,
+        "instances": [{
+            "id": "SAI_C1", "instanceType": "ScheduledActivityInstance",
+            "encounterId": "Encounter_C1", "epochId": "Epoch_2", "activityIds": ["Activity_2"],
+        }],
+        "timings": [{"id": "Timing_C1", "valueLabel": "Cycle 1 Day 1", "windowLabel": None}],
+    })
+    exit_code, result, fragment, _ = run(usdm, {"nctId": "NCT99999999", "soaTablesFound": 2})
+
+    check(exit_code == 0, "exits 0")
+    check(result.get("soaTablesModelled") == 2, "both timelines counted")
+    schedules = result.get("designs", [{}])[0].get("schedules", [])
+    check(len(schedules) == 2, f"two tables reported, got {len(schedules)}")
+    labels = {s["label"] for s in schedules}
+    check(labels == {"Main Timeline", "Cycle 1 Only"}, f"each table is named after its timeline, got {labels}")
+    check(fragment.count("<table") == 2, f"two tables rendered, got {fragment.count('<table')}")
+    check("2 schedules in this design" in fragment, "the report explains why there are two")
+
+    # The Cycle 1 visit must not appear as a column of the main schedule.
+    main = next(s for s in schedules if s["label"] == "Main Timeline")
+    cycle1 = next(s for s in schedules if s["label"] == "Cycle 1 Only")
+    check(main["encounters"] == 3, f"the main schedule keeps its 3 visits, got {main['encounters']}")
+    check(cycle1["encounters"] == 1, f"the Cycle 1 schedule has its 1 visit, got {cycle1['encounters']}")
+    # In the Cycle 1 table only Activity_2 is scheduled; the other two belong to
+    # the main schedule, so they are unknown there rather than "not scheduled".
+    check(cycle1["scheduled"] == 1, f"1 scheduled cell in the Cycle 1 table, got {cycle1['scheduled']}")
+    check(
+        cycle1["notScheduled"] == 0 and cycle1["unknown"] == 2,
+        f"activities from the other schedule are unknown, not absent: {cycle1}",
+    )
+
+
 def test_upstream_unresolved_is_surfaced() -> None:
     print("── the extraction step's own unresolved list is shown to the reviewer")
     upstream = {
         "nctId": "NCT99999999",
+        "soaTablesFound": 1,
         "unresolved": [{"path": "studyDesigns[0].activities", "reason": "SoA appendix was a scanned image"}],
     }
     exit_code, _, fragment, _ = run(complete_usdm(), upstream)
@@ -421,6 +500,9 @@ def main() -> int:
         test_broken_encounter_chain,
         test_missing_epoch_grouping,
         test_no_activities,
+        test_missing_whole_soa_table_is_flagged,
+        test_unreported_table_count_is_itself_a_gap,
+        test_multiple_timelines_render_as_separate_tables,
         test_upstream_unresolved_is_surfaced,
         test_missing_usdm_is_a_step_failure,
         test_html_is_escaped,

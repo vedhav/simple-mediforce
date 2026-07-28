@@ -302,6 +302,21 @@ absent `soaTablesFound` is itself a gap, because silence is indistinguishable
 from "there was only one". Both appear in `result.json` as `soaTablesFound` and
 `soaTablesModelled`.
 
+The prompt also asks for `soaTables[]` — one entry per source table with
+`sourceLabel`, `page`, `modelled`, and `timelineId` or a `note` explaining why it
+was left out. When present it is rendered as its own panel ("Source schedule
+tables: 4 of 6 drawn below"), each row tagged DRAWN or NOT DRAWN, and the
+shortfall gap names the undrawn tables rather than only counting them.
+
+### Visit order: `nextId` is authoritative
+
+A chain start is an entity **nothing points to**, not one whose own `previousId`
+is empty. On the real data three Cycle 1 regimens each declare
+`previousId: Screening`, but a linked list expresses one branch, so
+`Screening.nextId` names only one of them — finding heads via `previousId`
+silently dropped two entire schedules from the ordering. Several chains are
+normal and raise no gap; only an entity in a cycle does.
+
 Everything else the renderer could not resolve lands in `gaps[]` and in a panel
 above the table: missing names, visits with no resolvable `scheduledAtId`, a
 `previousId`/`nextId` chain that is not one consistent chain (the table then

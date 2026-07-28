@@ -327,19 +327,75 @@ def test_missing_timing() -> None:
     )
 
 
-def test_broken_encounter_chain() -> None:
-    print("── a broken visit order is flagged, not silently reordered")
+def test_circular_encounter_chain() -> None:
+    print("── a circular visit order is flagged, not silently reordered")
     usdm = complete_usdm()
-    design_of(usdm)["encounters"][1]["nextId"] = None
+    encounters = design_of(usdm)["encounters"]
+    encounters[2]["nextId"] = "Encounter_1"  # E1 -> E2 -> E3 -> E1
     exit_code, result, fragment, _ = run(usdm)
 
     check(exit_code == 0, "exits 0")
     ambiguous = [gap for gap in result.get("gaps", []) if gap["severity"] == "ambiguous"]
     check(
-        any("not stated as one consistent" in gap["message"] for gap in ambiguous),
-        f"the broken chain is reported as ambiguous: {ambiguous}",
+        any("circular nextId chain" in gap["message"] for gap in ambiguous),
+        f"the cycle is reported as ambiguous: {ambiguous}",
     )
     check("declaration order" in fragment, "the report says the shown order may not be the protocol's")
+
+
+def test_branching_chains_are_not_a_defect() -> None:
+    print("── alternative schedules branching off one visit must not be flagged")
+    # The real shape from NCT04822298: three Cycle 1 regimens all follow
+    # Screening, so each of their first visits says previousId=Screening while
+    # Screening.nextId can name only one of them. Finding heads via previousId
+    # misses two whole schedules; finding them via "nothing points here" does not.
+    usdm = complete_usdm()
+    encounters = design_of(usdm)["encounters"]
+    encounters[0]["nextId"] = "Encounter_2"
+    encounters[1]["previousId"] = "Encounter_1"
+    encounters[1]["nextId"] = None
+    encounters[2]["previousId"] = "Encounter_1"   # branch: also claims E1 as parent
+    encounters[2]["nextId"] = None
+    exit_code, result, _, _ = run(usdm)
+
+    check(exit_code == 0, "exits 0")
+    check(
+        not any("circular" in gap["message"] for gap in result.get("gaps", [])),
+        f"a branch raises no ordering gap: {result.get('gaps')}",
+    )
+    check(result.get("gapCount") == 0, f"no gaps at all, got {result.get('gaps')}")
+    check(
+        result.get("designs", [{}])[0].get("encounters") == 3,
+        "all three visits are still rendered — none is lost to an unwalked branch",
+    )
+
+
+def test_source_table_breakdown_is_itemised() -> None:
+    print("── the reviewer is told which source tables are not drawn, and why")
+    upstream = {
+        "nctId": "NCT99999999",
+        "soaTablesFound": 3,
+        "soaTables": [
+            {"sourceLabel": "Table 1-1. SoA (Cycle 2 and Beyond)", "page": 29,
+             "timelineId": "ScheduleTimeline_1", "modelled": True},
+            {"sourceLabel": "Table 1-5. PK Sampling Schedule", "page": 31, "modelled": False,
+             "note": "hours-relative-to-dose sub-schedule, not a visit grid"},
+            {"sourceLabel": "Table 1-6. Imaging Schedule", "page": 32, "modelled": False},
+        ],
+    }
+    exit_code, result, fragment, _ = run(complete_usdm(), upstream)
+
+    check(exit_code == 0, "exits 0")
+    check(len(result.get("sourceTables", [])) == 3, "all three source tables carried into the output")
+    check("Source schedule tables: 1 of 3 drawn below" in fragment, "the panel states the ratio")
+    check("Table 1-5. PK Sampling Schedule" in fragment, "the undrawn table is named")
+    check("not a visit grid" in fragment, "its stated reason is shown")
+    check("not drawn" in fragment, "undrawn tables are labelled as such")
+    check(
+        any("Table 1-5" in gap["message"] and "Table 1-6" in gap["message"]
+            for gap in result.get("gaps", [])),
+        f"the shortfall gap names both undrawn tables: {result.get('gaps')}",
+    )
 
 
 def test_missing_epoch_grouping() -> None:
@@ -497,7 +553,9 @@ def main() -> int:
         test_unplaceable_instance_does_not_license_not_scheduled,
         test_unnamed_activity,
         test_missing_timing,
-        test_broken_encounter_chain,
+        test_circular_encounter_chain,
+        test_branching_chains_are_not_a_defect,
+        test_source_table_breakdown_is_itemised,
         test_missing_epoch_grouping,
         test_no_activities,
         test_missing_whole_soa_table_is_flagged,

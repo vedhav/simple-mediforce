@@ -219,12 +219,28 @@ def order_by_chain(
     scope: str,
     kind: str,
 ) -> tuple[list[dict], bool]:
-    """Order entities by their `previousId`/`nextId` chain.
+    """Order entities by their `previousId`/`nextId` chains.
 
     USDM orders arrays through an explicit linked list rather than position.
-    A broken or partial chain is reported and the declaration order is used —
-    silently sorting on a broken chain would present an invented visit order as
-    the protocol's.
+    Several chains are normal, not a defect: a protocol with one schedule per
+    cycle or regimen chains each schedule's visits separately, so requiring a
+    single chain across all of them would flag every multi-schedule protocol.
+    Chains are therefore walked from every start point and concatenated in the
+    order their heads are declared.
+
+    A start point is an entity **nothing points to** — not one whose own
+    `previousId` is empty. The distinction matters: three alternative Cycle 1
+    regimens all follow screening, and each of their first visits says
+    `previousId: Screening`, but a linked list can only express one branch, so
+    `Screening.nextId` names just one of the three. Reading `previousId` to find
+    heads therefore misses two entire schedules. `nextId` is treated as
+    authoritative for order, and a `previousId` that disagrees with it is
+    ignored rather than reported — with branches it disagrees routinely.
+
+    Only an entity reachable from no start point — that is, one caught in a
+    cycle — is a genuine defect. Then the declaration order is used and said to
+    be unreliable, because silently sorting on a broken chain would present an
+    invented visit order as the protocol's.
     """
     identified = [entity for entity in entities if isinstance(entity.get("id"), str)]
     if len(identified) != len(entities):
@@ -238,33 +254,25 @@ def order_by_chain(
         for entity in identified
         if isinstance(entity.get("nextId"), str)
     }
-    heads = [
-        entity for entity in identified
-        if not isinstance(entity.get("previousId"), str) or entity["previousId"] not in by_id
-    ]
-
-    if len(heads) != 1 or len(successors) != len(identified) - 1:
-        gaps.ambiguous(
-            scope,
-            f"the {kind} order is not stated as one consistent previousId/nextId chain "
-            f"({len(heads)} start point(s), {len(successors)} link(s) for {len(identified)} {kind}s) — "
-            f"shown in declaration order, which may not be the protocol's order",
-        )
-        return list(entities), False
+    pointed_at = {target for target in successors.values() if target in by_id}
+    heads = [entity for entity in identified if entity["id"] not in pointed_at]
 
     ordered: list[dict] = []
     seen: set[str] = set()
-    cursor: str | None = heads[0]["id"]
-    while isinstance(cursor, str) and cursor in by_id and cursor not in seen:
-        seen.add(cursor)
-        ordered.append(by_id[cursor])
-        cursor = successors.get(cursor)
+    for head in heads:
+        cursor: str | None = head["id"]
+        while isinstance(cursor, str) and cursor in by_id and cursor not in seen:
+            seen.add(cursor)
+            ordered.append(by_id[cursor])
+            cursor = successors.get(cursor)
 
-    if len(ordered) != len(identified):
+    unreached = [entity for entity in identified if entity["id"] not in seen]
+    if unreached:
         gaps.ambiguous(
             scope,
-            f"the {kind} previousId/nextId chain reaches only {len(ordered)} of {len(identified)} "
-            f"{kind}s — shown in declaration order instead",
+            f"{len(unreached)} of {len(identified)} {kind}s sit in a circular nextId chain and so "
+            f"have no stated position ({len(heads)} start point(s), {len(successors)} link(s)) — "
+            f"everything is shown in declaration order, which may not be the protocol's order",
         )
         return list(entities), False
 
@@ -717,12 +725,34 @@ def build_model(usdm: dict, usdm_path: Path, upstream: dict, gaps: Gaps) -> dict
     # confident, complete-looking table and a "no gaps" verdict.
     found = upstream.get("soaTablesFound")
     modelled = sum(design["timelineCount"] for design in designs_built)
+    # The per-table breakdown, when the extraction step supplied one. It turns
+    # "2 tables are absent" into a statement of *which* two and why, which is
+    # the difference between a warning the reviewer can act on and one they have
+    # to go digging for.
+    source_tables = [
+        entry for entry in as_list(upstream.get("soaTables")) if isinstance(entry, dict)
+    ]
+    unmodelled = [
+        entry for entry in source_tables if entry.get("modelled") is not True
+    ]
+
     if isinstance(found, int) and found > modelled:
+        named = "; ".join(
+            f"{entry.get('sourceLabel') or 'unnamed table'}"
+            + (f" — {entry['note']}" if isinstance(entry.get("note"), str) and entry["note"] else "")
+            for entry in unmodelled
+        )
+        detail = (
+            f" The table(s) left out: {named}."
+            if named
+            else " The extraction step did not say which ones."
+        )
         gaps.missing(
             "study.versions[0].studyDesigns[].scheduleTimelines",
             f"the extraction step found {found} schedule-of-activities table(s) in the source "
             f"documents but modelled only {modelled} — {found - modelled} whole table(s) are absent "
-            "from this report. What is drawn below is therefore incomplete, however complete it looks",
+            f"from this report, so what is drawn below is incomplete however complete it looks."
+            f"{detail}",
         )
     elif found is None:
         gaps.missing(
@@ -741,6 +771,7 @@ def build_model(usdm: dict, usdm_path: Path, upstream: dict, gaps: Gaps) -> dict
         "designs": designs_built,
         "soaTablesFound": found if isinstance(found, int) else None,
         "soaTablesModelled": modelled,
+        "sourceTables": source_tables,
         "upstreamUnresolved": unresolved,
         "upstreamConfidence": upstream.get("confidence"),
     }
@@ -841,6 +872,7 @@ html.dark #soa-report {
 }
 .soa-tag-missing { background: var(--soa-unknown-bg); color: var(--soa-unknown-ink); }
 .soa-tag-ambiguous { background: var(--soa-amb-bg); color: var(--soa-amb-ink); }
+.soa-tag-drawn { background: var(--soa-yes-bg); color: var(--soa-yes-ink); }
 .soa-gap-scope { display: block; color: var(--soa-muted); font-size: 11px; margin-top: 1px; }
 
 .soa-toolbar {
@@ -1079,6 +1111,45 @@ def render_gap_panel(gaps: Gaps) -> str:
         f'<span class="soa-swatch unknown">?</span> cell below means &ldquo;not stated&rdquo;, never '
         "&ldquo;does not happen&rdquo;.</p>"
         f'<ul class="soa-gaps">{items}</ul></div>'
+    )
+
+
+def render_source_tables_panel(model: dict) -> str:
+    """Every SoA table the source documents contain, and whether it is drawn here."""
+    tables = model["sourceTables"]
+    if not tables:
+        return ""
+
+    rows = []
+    for entry in tables:
+        drawn = entry.get("modelled") is True
+        label = entry.get("sourceLabel") or "unnamed table"
+        page = entry.get("page")
+        note = entry.get("note") if isinstance(entry.get("note"), str) else None
+        where = entry.get("timelineId") if drawn else None
+        detail = " · ".join(
+            part for part in (
+                f"page {page}" if isinstance(page, int) else None,
+                f"drawn as {where}" if where else None,
+                note,
+            ) if part
+        )
+        rows.append(
+            f'<li><span class="soa-tag soa-tag-{"drawn" if drawn else "missing"}">'
+            f'{"drawn" if drawn else "not drawn"}</span>'
+            f"<span>{esc(label)}"
+            + (f'<code class="soa-gap-scope">{esc(detail)}</code>' if detail else "")
+            + "</span></li>"
+        )
+
+    drawn_count = sum(1 for entry in tables if entry.get("modelled") is True)
+    tone = "soa-panel" if drawn_count == len(tables) else "soa-panel soa-warn"
+    return (
+        f'<div class="{tone}">'
+        f"<h3>Source schedule tables: {drawn_count} of {len(tables)} drawn below</h3>"
+        "<p>Every schedule-of-activities table the extraction step found in the source documents. "
+        "A table marked <b>not drawn</b> is not represented anywhere in this report.</p>"
+        f'<ul class="soa-gaps">{"".join(rows)}</ul></div>'
     )
 
 
@@ -1331,6 +1402,7 @@ def render_fragment(model: dict, gaps: Gaps) -> str:
     <div class="soa-meta">{chip_html}{gap_chip}{unknown_chip}</div>
   </div>
   {render_gap_panel(gaps)}
+  {render_source_tables_panel(model)}
   {render_unresolved_panel(model)}
   {designs}
   <div class="soa-foot">
@@ -1409,6 +1481,7 @@ def main() -> None:
         "soaComplete": gaps.count() == 0 and unknown_total == 0 and renderable,
         "soaTablesFound": model["soaTablesFound"],
         "soaTablesModelled": model["soaTablesModelled"],
+        "sourceTables": model["sourceTables"],
         "designs": designs,
         "gapCount": gaps.count(),
         "gaps": gaps.entries,

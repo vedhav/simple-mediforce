@@ -394,8 +394,13 @@ def build_design(design: dict, index: int, gaps: Gaps) -> dict:
                     "value": activity_id,
                 })
                 continue
-            activities_with_data.add(activity_id)
+            # Only an instance that landed on a declared encounter counts as
+            # scheduling evidence. An instance with a missing or dangling
+            # encounterId could belong to any visit, so treating its activities
+            # as "covered" would license a "not scheduled" verdict in every
+            # other column on the strength of a reference we could not resolve.
             if isinstance(encounter_id, str):
+                activities_with_data.add(activity_id)
                 scheduled.add((activity_id, encounter_id))
 
     if instances_without_encounter > 0:

@@ -275,6 +275,29 @@ def test_dangling_references() -> None:
     check(result.get("soaComplete") is False, "soaComplete is false")
 
 
+def test_unplaceable_instance_does_not_license_not_scheduled() -> None:
+    print("── an activity known only from an unplaceable instance stays unknown everywhere")
+    usdm = complete_usdm()
+    timeline = design_of(usdm)["scheduleTimelines"][0]
+    # Activity_3 is scheduled only at Encounter_2. Repoint that instance at a
+    # visit that does not exist: the activity is still referenced, but nothing
+    # says where it happens, so no column may claim it is absent.
+    for instance in timeline["instances"]:
+        if instance["id"] == "SAI_2":
+            instance["encounterId"] = "Encounter_404"
+    exit_code, result, fragment, _ = run(usdm)
+
+    check(exit_code == 0, "exits 0")
+    rows = fragment.split('data-activity-label="PK sample"')
+    check(len(rows) == 2, "the PK sample row is present")
+    pk_row = rows[1].split("</tr>")[0]
+    claimed_absent = pk_row.count('data-state="not-scheduled"')
+    unknown = pk_row.count('data-state="unknown"')
+    check(claimed_absent == 0, f"no column claims the activity is absent, got {claimed_absent}")
+    check(unknown == 3, f"every cell in its row is unknown, got {unknown}")
+    check(len(result.get("danglingReferences", [])) == 1, "the unresolvable encounterId is reported")
+
+
 def test_unnamed_activity() -> None:
     print("── an activity with no name shows as unnamed, never as its id alone")
     usdm = complete_usdm()
@@ -392,6 +415,7 @@ def main() -> int:
         test_encounter_with_no_instance,
         test_activity_with_no_instance,
         test_dangling_references,
+        test_unplaceable_instance_does_not_license_not_scheduled,
         test_unnamed_activity,
         test_missing_timing,
         test_broken_encounter_chain,

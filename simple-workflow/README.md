@@ -1,9 +1,10 @@
 # simple-workflow
 
 Pick one ClinicalTrials.gov study from a fixed list of five, download every
-document that study has posted (protocol, SAP, ICF — whatever is there), then
-have an agent extract CDISC USDM study-definition metadata from those documents
-for human review.
+document that study has posted (protocol, SAP, ICF — whatever is there), have an
+agent extract CDISC USDM study-definition metadata from those documents, render
+its schedule of activities as an interactive table, and put both in front of a
+human reviewer.
 
 - Definition: [`src/simple-workflow.wd.json`](src/simple-workflow.wd.json)
 - Namespace: `vedha` on `https://cdisc.mediforce.ai`
@@ -14,6 +15,9 @@ for human review.
 select-study (human, CM0) ──► fetch-documents (script, CM0) ──► generate-usdm (agent, CM4)
                                                                       │            ▲
                                                                       ▼            │ revise
+                                                              render-soa (script, CM0)
+                                                                      │            │
+                                                                      ▼            │
                                                               review-usdm (human review)
                                                                       │ approve
                                                                       ▼
@@ -24,9 +28,27 @@ select-study (human, CM0) ──► fetch-documents (script, CM0) ──► gene
 |------|------|----------|-------|
 | `select-study` | `creation` | `human` | One required param `nctId`, rendered as a dropdown because the param declares `options`. Restricted to role `operator`. |
 | `fetch-documents` | `creation` | `script` (`script-container`) | Runs `fetch_study_documents.py` in a custom image. 10-minute timeout. Fails the step on any unrecoverable API or download error. |
-| `generate-usdm` | `creation` | `agent` (`claude-code-agent`) | `autonomyLevel: L4`. Reads the PDFs out of the run workspace, extracts the study definition, writes USDM v3.0.0. 45-minute timeout, `mediforce-golden-image`. |
+| `generate-usdm` | `creation` | `agent` (`claude-code-agent`) | `autonomyLevel: L4`. Reads the PDFs out of the run workspace, extracts the study definition, writes USDM v3.0.0 including the schedule of activities. 45-minute timeout, `mediforce-golden-image`. |
+| `render-soa` | `creation` | `script` (`script-container`) | Runs `render_soa.py` in the same image. Turns `usdm.json` into an interactive SoA table where every gap is visible as a gap. 10-minute timeout. |
 | `review-usdm` | `review` | `human` | Approve/revise gate. `revise` routes back to `generate-usdm` and requires a comment. Restricted to role `operator`. |
 | `done` | `terminal` | `human` | End state. No task is created — the engine marks the run `completed` as soon as a terminal step is the routing target. |
+
+### Why `render-soa` sits before the review and not after it
+
+The review task's context panel renders the **previous** step's `presentation`
+in a sandboxed iframe (`task-context-panel.tsx` → `SandboxedHtmlIframe` →
+`buildSrcdoc`), so putting the renderer immediately upstream of `review-usdm` is
+what puts the table in front of the reviewer while they decide. After the
+approve verdict it would render for nobody.
+
+Inserting it there costs nothing the old graph had. `review-usdm` is an explicit
+`type: review` human step, so its own step output is
+`{ verdict, reviewerComment, reviewerCallToAction }` either way
+(`buildVerdictStepOutput`, `complete-human-task.ts:155-168`) — it never carried
+the upstream step's result. The engine's "cannot approve, agent produced no
+output" guard also does not change: that fires only when
+`completionData.reviewType === 'agent_output_review'`, which only the built-in
+L3 path sets (`agent-step-executor.ts:165`), never an explicit review step.
 
 ### Why the review is its own step and not `autonomyLevel: L3`
 
@@ -188,16 +210,115 @@ gate is already mandatory, so escalation would be redundant.
 studyVersion (versionIdentifier, titles, studyIdentifiers, studyType,
 studyPhase), studyDesign (interventionModel, blindingSchema, arms, epochs,
 elements, studyCells, objectives with nested endpoints, population,
-eligibilityCriteria, studyInterventions), and documentedBy. `activities` and
-`encounters` — the schedule of activities — are best-effort and stay `[]` with an
-`unresolved` entry when the SoA table does not extract legibly. Estimands,
-amendments, and biomedical concepts are out of scope.
+eligibilityCriteria, studyInterventions), the schedule of activities
+(`activities`, `encounters`, `scheduleTimelines` with their `instances` and
+`timings`), and documentedBy. Estimands, amendments, and biomedical concepts are
+out of scope.
+
+The schedule of activities is **required**, not best-effort, because
+`render-soa` draws it. The prompt's rule is that an unreadable part is left out
+*whole* rather than partly guessed: no `ScheduledActivityInstance` for an
+illegible visit column, no mention in any `activityIds` for an illegible
+activity row, and an `unresolved` entry either way. That makes the omission
+render as UNKNOWN instead of as a confident blank — see
+[`render-soa`](#render-soa) for how the renderer reads it.
 
 The prompt forbids inventing content: anything the protocol does not state
 becomes `null` plus an `unresolved` entry, and a CDISC CT code the agent is not
 confident of becomes `"code": null` with the verbatim wording kept in `decode`.
 A sparse-but-true USDM is the intended output; catching the opposite is what
 `review-usdm` is for.
+
+### `render-soa`
+
+Reads `usdm.json` out of the run worktree and writes three files.
+
+| File | Purpose |
+|------|---------|
+| `presentation.html` | A **body fragment**, not a document. `script-container-plugin.ts:426-440` reads it back as the step's `presentation`, and `buildSrcdoc` injects it into a document it builds itself — so a full `<!DOCTYPE html>` here would nest. `presentation.md` is preferred over HTML when both exist, so this step must not write one. |
+| `schedule-of-activities.html` | The same report as a standalone document, for download. |
+| `result.json` | The step output value: counts, `gaps[]`, `danglingReferences[]`, `soaComplete`. Carries no HTML. |
+
+Both HTML files are self-contained — inline CSS and JS, no external requests.
+That is a hard requirement, not tidiness: `buildSrcdoc` sets a CSP of
+`default-src 'none'` with `connect-src 'none'`, so anything fetched at runtime
+is blocked. Inline `<script>` and `<style>` are allowed (`script-src
+'unsafe-inline'`), which is what makes the filtering and cell-detail
+interactions work inside the review task. The stylesheet handles light and dark
+through both `prefers-color-scheme` and the `html.dark` class the host toggles
+via its `postMessage` theme sync.
+
+#### Three cell states, and why `unknown` is the default
+
+USDM cannot say "this cell is unknown" — an activity either is or is not listed
+by a `ScheduledActivityInstance`. A renderer that maps that straight to a
+two-state ✕/blank grid therefore turns **every extraction failure into a
+confident "not scheduled"**, which is exactly the error a reviewer cannot catch.
+So each cell resolves to one of three states, and `not scheduled` is claimed only
+when the evidence for it exists:
+
+| State | Shown as | Meaning |
+|-------|----------|---------|
+| scheduled | green `✕` | An instance at that encounter lists that activity. |
+| not scheduled | grey `·` | The timeline covers **both** that activity and that encounter, and does not pair them. |
+| unknown | amber `?` | There is no timeline at all, **or** no instance references that encounter, **or** no instance references that activity. |
+
+An unreferenced encounter makes its whole column unknown; an unreferenced
+activity makes its whole row unknown. Both are reported in `gaps`.
+
+Everything else the renderer could not resolve lands in `gaps[]` and in a panel
+above the table: missing names, visits with no resolvable `scheduledAtId`, a
+`previousId`/`nextId` chain that is not one consistent chain (the table then
+falls back to declaration order and says so), visits with no epoch,
+`activityIds`/`encounterId` values pointing at ids the design never declares, and
+activity `childIds` hierarchies that the flat table does not show. The
+`unresolved[]` list from `generate-usdm`'s own output is surfaced verbatim in its
+own panel.
+
+```json
+{
+  "nctId": "NCT04822298",
+  "studyTitle": "…",
+  "usdmSource": "/workspace/usdm/usdm.json",
+  "tableRendered": true,
+  "soaComplete": false,
+  "designs": [{ "id": "StudyDesign_1", "label": "…", "activities": 20, "encounters": 11,
+                "scheduled": 80, "notScheduled": 90, "unknown": 50, "danglingReferences": 0 }],
+  "gapCount": 5,
+  "gaps": [{ "severity": "missing", "scope": "studyDesigns[0].activities[14]",
+             "message": "no scheduled activity instance references activity 'PK blood sample', so its whole row is unknown rather than empty" }],
+  "danglingReferences": [],
+  "outputFiles": ["presentation.html", "schedule-of-activities.html"],
+  "summary": "Rendered 20 activity(ies) x 11 visit(s), 80 scheduled, 50 unknown cell(s) and 5 gap(s) flagged for review"
+}
+```
+
+`severity` is `missing` (the source said nothing) or `ambiguous` (it said
+something that could not be reconciled). `soaComplete` is true only when there
+are no gaps, no unknown cells, and a table was actually drawn.
+
+**A data gap is not a step failure.** Empty `activities`, no
+`scheduleTimelines`, an unreadable SoA — all of these exit 0 and render a report
+that says so, because the point is for the reviewer to see the hole and hit
+revise. The step fails (exit 1, `error` in `result.json` plus a bounded
+worktree listing) only when `usdm.json` is absent or unparseable, which is a
+broken upstream contract rather than missing study data.
+
+The interactive controls are a filter box over activity names, a
+gaps-only toggle, an outline-the-unknowns toggle, and click-a-cell-for-detail.
+The gaps-only toggle deliberately matches an activity's **own** gaps — never
+scheduled anywhere, or unknown at a visit that does have scheduling data — and
+excludes cells that are unknown only because their whole visit column is
+unknown. Without that distinction one unknown column marks every row and the
+filter stops discriminating.
+
+`usdm.json` is looked up at `/workspace/usdm/usdm.json`, then
+`/workspace/.mediforce/output/generate-usdm/usdm.json`, then by walking the
+worktree. Both preferred paths exist because every step of a run mounts the same
+git worktree at `/workspace`: the agent writes the first directly, and the engine
+commits its `/output` copy to the second (`copyOutputFilesIntoWorkspace`). The
+search is the fallback for an agent that followed only part of its output
+contract.
 
 ### `review-usdm`
 
@@ -229,7 +350,8 @@ backoff before failing the step.
 | `OPENROUTER_API_KEY` | yes | workflow (or namespace) | `generate-usdm` | OpenRouter key, injected as `ANTHROPIC_AUTH_TOKEN` so the Claude Code CLI in the container routes through OpenRouter. | `mediforce secret set --key OPENROUTER_API_KEY` | `sk-or-v1-…` |
 | `ANTHROPIC_BASE_URL` | no | literal in the step | `generate-usdm` | `https://openrouter.ai/api`. Hardcoded rather than a secret — it is not sensitive, and `resolveStepEnv` passes non-`{{…}}` values through verbatim. | Literal in `.wd.json` | `https://openrouter.ai/api` |
 | `ANTHROPIC_API_KEY` | no | literal in the step | `generate-usdm` | Deliberately empty string. The Claude Code CLI prefers it over `ANTHROPIC_AUTH_TOKEN` when set, so leaving it unset-but-inherited would bypass OpenRouter. | Literal `""` in `.wd.json` | `""` |
-| `MEDIFORCE_OUTPUT_DIR` | no | not set in production | `fetch-documents` | Overrides the script's output directory. Exists so the test suite can run the real script outside a container; **leave unset** on the platform, where it correctly defaults to `/output`. | Not set — test-only | `/tmp/scratch` |
+| `MEDIFORCE_OUTPUT_DIR` | no | not set in production | `fetch-documents`, `render-soa` | Overrides the script's output directory. Exists so the test suite can run the real script outside a container; **leave unset** on the platform, where it correctly defaults to `/output`. | Not set — test-only | `/tmp/scratch` |
+| `MEDIFORCE_WORKSPACE_DIR` | no | not set in production | `render-soa` | Same idea for the run worktree the script reads `usdm.json` out of. **Leave unset** on the platform, where it correctly defaults to `/workspace`. | Not set — test-only | `/tmp/scratch/workspace` |
 
 Set the OpenRouter key once:
 
@@ -292,9 +414,15 @@ script container by the runtime; this script does not read them.
 
 `Dockerfile` builds from `mediforce-golden-image` and copies `scripts/` to
 `/opt/simple-workflow/scripts/`. That is its only job — a `command` step can
-only execute code already present in the container, so the script has to be
-baked in. `fetch_study_documents.py` uses the Python standard library only, so
-there is no `apt-get` or `pip install` layer.
+only execute code already present in the container, so the scripts have to be
+baked in. Both `fetch_study_documents.py` and `render_soa.py` use the Python
+standard library only, so there is no `apt-get` or `pip install` layer.
+
+One image serves both script steps. `fetch-documents` and `render-soa` share the
+same `dockerfile` + `repo` + `commit`, and the build tag is
+`sha256(repo + commit + dockerfile)` (`deriveBuildTag`, `container-plugin.ts`),
+so they resolve to one tag and one build. Pinning them to different commits would
+build the same image twice for no reason — keep the two SHAs equal.
 
 Build mode is pinned per golden-rules §2:
 
@@ -303,7 +431,7 @@ Build mode is pinned per golden-rules §2:
   "command": "python3 /opt/simple-workflow/scripts/fetch_study_documents.py",
   "dockerfile": "simple-workflow/Dockerfile",
   "repo": "https://github.com/vedhav/simple-mediforce.git",
-  "commit": "3b649d0e60624f044f1704f78c139637fac457ea",
+  "commit": "<the pinned SHA below>",
   "timeoutMinutes": 10
 }
 ```
@@ -359,7 +487,8 @@ See [`tests/TEST_SUMMARY.md`](tests/TEST_SUMMARY.md).
 python3 tests/run_tests.py
 ```
 
-No credentials needed; requires outbound network to clinicaltrials.gov.
+No credentials needed. `test_fetch_documents.py` needs outbound network to
+clinicaltrials.gov; `test_render_soa.py` needs nothing and runs offline.
 
 ## Manual platform setup
 
@@ -402,9 +531,13 @@ submit. `fetch-documents` should complete with `documentCount: 2` and list
 `NCT04822298_Prot_000.pdf` and `NCT04822298_SAP_001.pdf` as Output Files.
 
 `generate-usdm` then runs unattended for up to 45 minutes and should complete
-with `integrityCheck.passed: true` and three Output Files. Finally
-`review-usdm` creates a task for role `operator`; approve it and the run reaches
-`completed`.
+with `integrityCheck.passed: true` and three Output Files. `render-soa` follows
+in seconds and should complete with `tableRendered: true` and two Output Files.
+Finally `review-usdm` creates a task for role `operator` with the SoA table
+rendered in its context panel; approve it and the run reaches `completed`.
+
+Expect the **first** run after a re-pinned `commit` to be slower than the
+timeouts suggest — it pays the image build before the script starts.
 
 ```bash
 # start
@@ -419,6 +552,10 @@ pnpm exec mediforce task complete <taskId> \
 pnpm exec mediforce run get <runId> --json
 pnpm exec mediforce run files <runId>
 pnpm exec mediforce run download <runId> --step generate-usdm
+
+# read the rendered schedule of activities
+pnpm exec mediforce run download <runId> --step render-soa
+open schedule-of-activities.html
 
 # approve (or send it back)
 pnpm exec mediforce task complete <taskId> --payload '{"kind":"verdict","verdict":"approve"}'

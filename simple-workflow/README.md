@@ -436,10 +436,11 @@ Build mode is pinned per golden-rules §2:
 }
 ```
 
-**Pinning state: pinned to
-`https://github.com/vedhav/simple-mediforce.git`@`3b649d0e60624f044f1704f78c139637fac457ea`.**
+**Pinning state: both script steps pinned to
+`https://github.com/vedhav/simple-mediforce.git`@`003c8cec48c59209adfad7c9826bc97bce554715`.**
 
-That commit is the one whose `simple-workflow/` tree the image builds from. It
+That commit is the one whose `simple-workflow/` tree the image builds from — the
+one that added `render_soa.py`. It
 stays reachable as an ancestor of `main` as HEAD moves on, so the build SHA is
 allowed to lag HEAD — it does not need to be re-pinned for unrelated changes,
 only when `Dockerfile` or `scripts/` change.

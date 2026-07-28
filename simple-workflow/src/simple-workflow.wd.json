@@ -45,7 +45,7 @@
         "command": "python3 /opt/simple-workflow/scripts/fetch_study_documents.py",
         "dockerfile": "simple-workflow/Dockerfile",
         "repo": "https://github.com/vedhav/simple-mediforce.git",
-        "commit": "3b649d0e60624f044f1704f78c139637fac457ea",
+        "commit": "003c8cec48c59209adfad7c9826bc97bce554715",
         "repoAuth": "GITHUB_TOKEN",
         "timeoutMinutes": 10
       }
@@ -83,7 +83,7 @@
         "command": "python3 /opt/simple-workflow/scripts/render_soa.py",
         "dockerfile": "simple-workflow/Dockerfile",
         "repo": "https://github.com/vedhav/simple-mediforce.git",
-        "commit": "0000000000000000000000000000000000000000",
+        "commit": "003c8cec48c59209adfad7c9826bc97bce554715",
         "repoAuth": "GITHUB_TOKEN",
         "timeoutMinutes": 10
       }

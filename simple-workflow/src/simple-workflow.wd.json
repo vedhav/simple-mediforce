@@ -7,6 +7,9 @@
     { "type": "manual", "name": "manual" }
   ],
   "roles": ["operator"],
+  "env": {
+    "GITHUB_TOKEN": "{{GITHUB_TOKEN}}"
+  },
   "steps": [
     {
       "id": "select-study",
@@ -43,6 +46,7 @@
         "dockerfile": "simple-workflow/Dockerfile",
         "repo": "https://github.com/vedhav/simple-mediforce.git",
         "commit": "3b649d0e60624f044f1704f78c139637fac457ea",
+        "repoAuth": "GITHUB_TOKEN",
         "timeoutMinutes": 10
       }
     },

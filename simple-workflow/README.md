@@ -110,11 +110,46 @@ backoff before failing the step.
 
 ## Env and secrets
 
-No secrets. The workflow declares no `env` and references no `{{SECRET_NAME}}`.
-
 | Name | Secret | Scope | Used by | Meaning | How to set | Example |
 |------|--------|-------|---------|---------|------------|---------|
+| `GITHUB_TOKEN` | yes | workflow (or namespace) | `fetch-documents` | Clone token for the Docker build context. Required **even though this repo is public** — see below. | `mediforce secret set --key GITHUB_TOKEN` | zero-scope fine-grained PAT |
 | `MEDIFORCE_OUTPUT_DIR` | no | not set in production | `fetch-documents` | Overrides the script's output directory. Exists so the test suite can run the real script outside a container; **leave unset** on the platform, where it correctly defaults to `/output`. | Not set — test-only | `/tmp/scratch` |
+
+### Why a public repo still needs a token
+
+`resolveImageBuild` runs every `repo` value through `normalizeRepoUrls`
+(`container-plugin.ts:167`), which rewrites `https://github.com/…` to
+`git@github.com:…`. **There is no anonymous-HTTPS build path.** Without a token
+the builder clones over SSH using the deployment's deploy key; on
+`cdisc.mediforce.ai` that key is mode 0755, which SSH rejects, so the build fails
+with `Permission denied (publickey)` — an error that points at infrastructure
+rather than at the missing token.
+
+A token flips the transport back to HTTPS via `toHttpsWithToken`. Two things are
+needed, and omitting **either** produces the identical SSH error:
+
+```jsonc
+"env": { "GITHUB_TOKEN": "{{GITHUB_TOKEN}}" },   // resolveStepEnv only exposes declared keys
+"script": { "repoAuth": "GITHUB_TOKEN", … }
+```
+
+`repoAuth` alone silently resolves to `undefined` (`resolveRepoToken` reads
+`resolvedEnv[authKey]`) and falls back to SSH without complaining.
+
+Because the repo is public the token needs **no scopes at all** — a
+zero-permission fine-grained PAT is sufficient, and preferable given the
+credential lives on a shared deployment.
+
+Set it once:
+
+```bash
+printf '%s' "<token>" | MEDIFORCE_API_KEY="$(cat ~/.config/mediforce/cdisc-key)" \
+  pnpm exec mediforce secret set --key GITHUB_TOKEN --stdin \
+  --namespace vedha --workflow simple-workflow --base-url https://cdisc.mediforce.ai
+```
+
+Omit `--workflow` to set it namespace-wide so every workflow in `vedha` inherits
+it.
 
 `RUN_ID`, `STEP_ID`, and `MEDIFORCE_RUN_NAMESPACE` are injected into every
 script container by the runtime; this script does not read them.

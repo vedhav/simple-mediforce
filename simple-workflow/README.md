@@ -1,8 +1,9 @@
 # simple-workflow
 
-Pick one ClinicalTrials.gov study from a fixed list of five, then download every
-document that study has posted (protocol, SAP, ICF — whatever is there) as run
-output files.
+Pick one ClinicalTrials.gov study from a fixed list of five, download every
+document that study has posted (protocol, SAP, ICF — whatever is there), then
+have an agent extract CDISC USDM study-definition metadata from those documents
+for human review.
 
 - Definition: [`src/simple-workflow.wd.json`](src/simple-workflow.wd.json)
 - Namespace: `vedha` on `https://cdisc.mediforce.ai`
@@ -10,14 +11,52 @@ output files.
 ## Graph
 
 ```text
-select-study (human, CM0) ──► fetch-documents (script, CM0) ──► done (terminal)
+select-study (human, CM0) ──► fetch-documents (script, CM0) ──► generate-usdm (agent, CM4)
+                                                                      │            ▲
+                                                                      ▼            │ revise
+                                                              review-usdm (human review)
+                                                                      │ approve
+                                                                      ▼
+                                                                 done (terminal)
 ```
 
 | Step | Type | Executor | Notes |
 |------|------|----------|-------|
 | `select-study` | `creation` | `human` | One required param `nctId`, rendered as a dropdown because the param declares `options`. Restricted to role `operator`. |
 | `fetch-documents` | `creation` | `script` (`script-container`) | Runs `fetch_study_documents.py` in a custom image. 10-minute timeout. Fails the step on any unrecoverable API or download error. |
+| `generate-usdm` | `creation` | `agent` (`claude-code-agent`) | `autonomyLevel: L4`. Reads the PDFs out of the run workspace, extracts the study definition, writes USDM v3.0.0. 45-minute timeout, `mediforce-golden-image`. |
+| `review-usdm` | `review` | `human` | Approve/revise gate. `revise` routes back to `generate-usdm` and requires a comment. Restricted to role `operator`. |
 | `done` | `terminal` | `human` | End state. No task is created — the engine marks the run `completed` as soon as a terminal step is the routing target. |
+
+### Why the review is its own step and not `autonomyLevel: L3`
+
+`agent` + `autonomyLevel: L3` (control mode CM3, "human review") has a built-in
+review gate: `agent-step-executor.ts` pauses the run and creates an
+`agent_review_l3` human task on the agent step itself, and a `revise` verdict
+re-runs the agent. It looks like exactly what this workflow wants, and it is one
+step instead of two — but **the reviewer's comment never reaches the agent.**
+
+`complete-human-task.ts` builds a `reviewerCallToAction` string from the
+comment, but on the L3 path `isL3Revise` is true, so `advanceStep` is skipped
+(`workflow-engine.ts:757`) and the step output — comment included — is never
+written to `instance.variables`. The auto-runner then re-executes the agent with
+`{ ...previousStepOutput, steps: instance.variables }`
+(`run/route.ts:834`), which still holds only the *previous agent output*. The
+revise loop re-runs the agent blind.
+
+An explicit `type: review` human step does not have this problem: its completion
+is not `isL3Revise`, so `advanceStep` runs, `variables['review-usdm']` gets
+`{ verdict, reviewerComment, reviewerCallToAction }`, and the next agent
+iteration reads it from `steps['review-usdm']`. That is why `generate-usdm` is
+`L4` (autonomous — the explicit step is the gate; `L3` would double-gate) and
+`review-usdm` carries the verdicts. It is also the pattern `cdisc-case-3` uses
+for all three of its review gates.
+
+One consequence worth knowing: `review.maxIterations` is only enforced in
+`submitReviewVerdict`, which is the *agent*-reviewer path. Human review tasks go
+through `completeHumanTask`, so the revise loop here is bounded by the reviewer's
+judgement and by the engine's per-step attempt cap, not by `maxIterations`. There
+is no point setting that field on `review-usdm`.
 
 A terminal step is not optional: `validateStepGraph` rejects a definition with
 no `type: terminal` step.
@@ -98,6 +137,80 @@ Two limits worth knowing:
 - Run branches are never pushed — the bytes live on the deployment host and are
   reached through the UI, not from a remote repo.
 
+This copy is also how `generate-usdm` gets the PDFs. Output Files land at
+`.mediforce/output/<stepId>/` in the run's git worktree, every step of a run
+mounts that same worktree at `/workspace`, so the agent reads them from
+`/workspace/.mediforce/output/fetch-documents/`. The prompt does not trust that
+path blindly — it runs `find /workspace /data -name '*.pdf'` first and fails with
+a directory listing if nothing turns up, so a wrong assumption shows up as a
+readable error instead of invented study data.
+
+### `generate-usdm`
+
+Writes three deliverables to **both** `/workspace/usdm/` (committed to the run
+branch) and `/output/` (surfaces as this step's Output Files):
+
+| File | Purpose |
+|------|---------|
+| `usdm.json` | The USDM v3.0.0 envelope — `{ usdmVersion, systemName, study }`. Real USDM class and attribute names throughout. |
+| `usdm-provenance.json` | `{ nctId, entries: [{ path, sourceFile, page, quote }] }`. Required for every title, identifier, studyType, studyPhase, interventionModel, blindingSchema, arm, epoch, objective, endpoint and eligibility criterion. |
+| `usdm-summary.md` | What the reviewer reads to decide approve vs revise. |
+
+`result.json` — the step's output value — deliberately carries no USDM payload:
+
+```json
+{
+  "nctId": "NCT04822298",
+  "usdmVersion": "3.0.0",
+  "studyTitle": "…",
+  "studyPhase": "Phase III Trial",
+  "sourceDocuments": [{ "filename": "…", "typeAbbrev": "Prot", "pages": 214, "usedAs": "primary" }],
+  "counts": { "titles": 2, "studyIdentifiers": 1, "arms": 2, "epochs": 3, "elements": 3,
+              "studyCells": 6, "objectives": 4, "endpoints": 9, "inclusionCriteria": 12,
+              "exclusionCriteria": 18, "studyInterventions": 2, "activities": 0 },
+  "integrityCheck": { "passed": true, "danglingReferences": [] },
+  "unresolved": [{ "path": "…", "reason": "…" }],
+  "outputFiles": ["usdm.json", "usdm-provenance.json", "usdm-summary.md"],
+  "confidence": 0.0,
+  "confidence_rationale": "…",
+  "summary": "…"
+}
+```
+
+`confidence` and `confidence_rationale` are not optional decoration — the agent
+runtime appends a "Confidence Self-Assessment" section to every agent prompt and
+requires both fields. `confidenceThreshold: 0.6` with
+`fallbackBehavior: continue_with_flag` means a low-confidence extraction still
+flows to `review-usdm` flagged, rather than escalating separately; the review
+gate is already mandatory, so escalation would be redundant.
+
+**USDM scope is a documented subset, not the full model.** Populated: study,
+studyVersion (versionIdentifier, titles, studyIdentifiers, studyType,
+studyPhase), studyDesign (interventionModel, blindingSchema, arms, epochs,
+elements, studyCells, objectives with nested endpoints, population,
+eligibilityCriteria, studyInterventions), and documentedBy. `activities` and
+`encounters` — the schedule of activities — are best-effort and stay `[]` with an
+`unresolved` entry when the SoA table does not extract legibly. Estimands,
+amendments, and biomedical concepts are out of scope.
+
+The prompt forbids inventing content: anything the protocol does not state
+becomes `null` plus an `unresolved` entry, and a CDISC CT code the agent is not
+confident of becomes `"code": null` with the verbatim wording kept in `decode`.
+A sparse-but-true USDM is the intended output; catching the opposite is what
+`review-usdm` is for.
+
+### `review-usdm`
+
+Completes with kind `verdict`. `revise` requires a comment
+(`requiresComment: true` on the verdict, `requiredForVerdicts: ["revise"]` on the
+param). Step output is the agent's `result.json` plus `verdict`,
+`reviewerComment`, and `reviewerCallToAction` — see the L3 discussion above for
+why that matters.
+
+Approving an agent step whose result is empty is blocked by the engine
+(`Cannot approve step '…': agent produced no output`), so a failed extraction
+cannot be rubber-stamped.
+
 ## Data sources
 
 | Purpose | Endpoint |
@@ -113,7 +226,28 @@ backoff before failing the step.
 | Name | Secret | Scope | Used by | Meaning | How to set | Example |
 |------|--------|-------|---------|---------|------------|---------|
 | `GITHUB_TOKEN` | yes | workflow (or namespace) | `fetch-documents` | Clone token for the Docker build context. Required **even though this repo is public** — see below. | `mediforce secret set --key GITHUB_TOKEN` | zero-scope fine-grained PAT |
+| `OPENROUTER_API_KEY` | yes | workflow (or namespace) | `generate-usdm` | OpenRouter key, injected as `ANTHROPIC_AUTH_TOKEN` so the Claude Code CLI in the container routes through OpenRouter. | `mediforce secret set --key OPENROUTER_API_KEY` | `sk-or-v1-…` |
+| `ANTHROPIC_BASE_URL` | no | literal in the step | `generate-usdm` | `https://openrouter.ai/api`. Hardcoded rather than a secret — it is not sensitive, and `resolveStepEnv` passes non-`{{…}}` values through verbatim. | Literal in `.wd.json` | `https://openrouter.ai/api` |
+| `ANTHROPIC_API_KEY` | no | literal in the step | `generate-usdm` | Deliberately empty string. The Claude Code CLI prefers it over `ANTHROPIC_AUTH_TOKEN` when set, so leaving it unset-but-inherited would bypass OpenRouter. | Literal `""` in `.wd.json` | `""` |
 | `MEDIFORCE_OUTPUT_DIR` | no | not set in production | `fetch-documents` | Overrides the script's output directory. Exists so the test suite can run the real script outside a container; **leave unset** on the platform, where it correctly defaults to `/output`. | Not set — test-only | `/tmp/scratch` |
+
+Set the OpenRouter key once:
+
+```bash
+printf '%s' "<sk-or-v1-…>" | MEDIFORCE_API_KEY="$(cat ~/.config/mediforce/cdisc-key)" \
+  pnpm exec mediforce secret set --key OPENROUTER_API_KEY --stdin \
+  --namespace vedha --base-url https://cdisc.mediforce.ai
+```
+
+Omitting `--workflow` makes it namespace-wide, so every workflow in `vedha`
+inherits it — preferable to the workflow-scoped copies that
+`master-workflow` and `protocol-to-tlf` each carry today.
+
+A missing secret is caught before any container starts: the run **pauses** at its
+first step with `pauseReason` set and the missing-secret list as the error, e.g.
+`[{"secretName":"GITHUB_TOKEN","template":"{{GITHUB_TOKEN}}","steps":[…]}]`.
+Registration does not check secrets, so a definition referencing an unset secret
+registers cleanly and only fails when run.
 
 ### Why a public repo still needs a token
 
@@ -185,18 +319,37 @@ only when `Dockerfile` or `scripts/` change.
 `dockerfile` is repo-root-relative; the build context is that file's own
 directory, so `COPY scripts/` resolves to `simple-workflow/scripts/`. Do not
 move the Dockerfile into a subfolder — the context would move with it and the
-`COPY` would fail. The repo is public, so the builder clones anonymously over
-HTTPS and no `repoAuth` is needed.
+`COPY` would fail. `repoAuth` **is** required despite the repo being public — see
+"Why a public repo still needs a token" above.
 
 `FROM mediforce-golden-image` is untagged (so, `:latest`). That is the base the
 platform documents in golden-rules §3 and matches the other workflows on this
 deployment.
 
+`generate-usdm` needs no Dockerfile of its own: it runs `mediforce-golden-image`
+directly as a prebuilt `image`, which already carries the Claude Code CLI and
+`poppler-utils` (so `pdftotext`). Because that step pins no `repo`/`commit`,
+nothing about it has to be re-pinned when this repo moves. The tag must exist on
+the deployment's Docker host — it does, since `fetch-documents` builds `FROM` it.
+
 ## Agents, MCPs, skills
 
-None. There is no `agent` or `cowork` step, so there is no Agent Definition, no
-Tool Catalog entry, and no `externalSkillsRepo`. Golden-rules §4 and §7 do not
-apply.
+`generate-usdm` is a `claude-code-agent` step with an **inline `agent.prompt`** —
+no `skill` / `skillsDir`, no Agent Definition, no MCP servers, no
+`externalSkillsRepo`. The prompt is self-contained, so the step needs no custom
+image and no commit pin. Move it to a `SKILL.md` when it starts being shared
+across steps or grows past comfortable inline size; until then a skill would add
+a plugin directory, a `skillsDir` bind-mount, and a custom image for no gain.
+
+No governable MCP is in play, so golden-rules §7 (Tool Catalog + Agent
+Definitions) does not apply. §4 does: the step declares an output contract and an
+explicit `timeoutMinutes`.
+
+The step uses the default Claude Code tool set (Bash, Read, Write, Edit, Glob,
+Grep) — no `allowedTools` override. It needs no internet access: every source
+document is already on disk from `fetch-documents`, and granting `WebFetch` would
+let the agent pull study data from the web instead of the protocol it was told to
+read.
 
 ## Tests
 
@@ -246,5 +399,42 @@ pnpm exec mediforce workflow import \
 There is no start form. Start a run from the manual trigger, open the
 `Select Study` task, choose `NCT04822298` (smallest documents, ~3 MB total) and
 submit. `fetch-documents` should complete with `documentCount: 2` and list
-`NCT04822298_Prot_000.pdf` and `NCT04822298_SAP_001.pdf` as Output Files, then
-the run should reach `completed`.
+`NCT04822298_Prot_000.pdf` and `NCT04822298_SAP_001.pdf` as Output Files.
+
+`generate-usdm` then runs unattended for up to 45 minutes and should complete
+with `integrityCheck.passed: true` and three Output Files. Finally
+`review-usdm` creates a task for role `operator`; approve it and the run reaches
+`completed`.
+
+```bash
+# start
+pnpm exec mediforce run start --workflow simple-workflow --namespace vedha --json
+
+# pick the study
+pnpm exec mediforce task list --namespace vedha
+pnpm exec mediforce task complete <taskId> \
+  --payload '{"kind":"params","paramValues":{"nctId":"NCT04822298"}}'
+
+# read what the agent produced
+pnpm exec mediforce run get <runId> --json
+pnpm exec mediforce run files <runId>
+pnpm exec mediforce run download <runId> --step generate-usdm
+
+# approve (or send it back)
+pnpm exec mediforce task complete <taskId> --payload '{"kind":"verdict","verdict":"approve"}'
+pnpm exec mediforce task complete <taskId> \
+  --payload '{"kind":"verdict","verdict":"revise","comment":"arms are wrong — protocol has 3, see p.24"}'
+```
+
+The completion payload key is `paramValues` / `verdict`, never `params` — the
+union in `task-completion.ts` is `.strict()`, so a wrong key is rejected rather
+than silently ignored.
+
+## Verification status
+
+| Step | Status |
+|------|--------|
+| `select-study` | Verified by a real run (v1–v3, `completed`). |
+| `fetch-documents` | Verified by a real run (v3, run `81f01e42`, `completed`). |
+| `generate-usdm` | Schema + preflight only — **no run has executed it yet.** |
+| `review-usdm` | Schema + preflight only — **no run has executed it yet.** |

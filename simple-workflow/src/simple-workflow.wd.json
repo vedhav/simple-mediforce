@@ -1,7 +1,7 @@
 {
   "name": "simple-workflow",
   "title": "Simple Workflow",
-  "description": "Pick one ClinicalTrials.gov NCT id from a fixed list of five studies, then download every document the study has posted (protocol, SAP, ICF) as run output files.",
+  "description": "Pick one ClinicalTrials.gov NCT id from a fixed list of five studies, download every document the study has posted (protocol, SAP, ICF), then have an agent extract CDISC USDM study-definition metadata from those documents for human review.",
   "visibility": "private",
   "triggers": [
     { "type": "manual", "name": "manual" }
@@ -51,6 +51,58 @@
       }
     },
     {
+      "id": "generate-usdm",
+      "name": "Generate USDM Metadata",
+      "type": "creation",
+      "executor": "agent",
+      "plugin": "claude-code-agent",
+      "autonomyLevel": "L4",
+      "description": "AI. Reads the protocol (and SAP / ICF when present) downloaded by Fetch Study Documents out of the run workspace, extracts the study definition, and writes CDISC USDM v3.0.0 metadata as usdm.json, with usdm-provenance.json for page-level traceability and usdm-summary.md for the reviewer. All three land in /output as step Output Files and in /workspace/usdm/ on the run branch. On a revise re-entry, reads the reviewer's comment from the review-usdm step and corrects only the flagged items.",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "{{OPENROUTER_API_KEY}}",
+        "ANTHROPIC_API_KEY": "",
+        "ANTHROPIC_BASE_URL": "https://openrouter.ai/api"
+      },
+      "agent": {
+        "model": "anthropic/claude-sonnet-5",
+        "image": "mediforce-golden-image",
+        "timeoutMinutes": 45,
+        "confidenceThreshold": 0.6,
+        "fallbackBehavior": "continue_with_flag",
+        "prompt": "You are a CDISC USDM data engineer. Extract the study definition from the study documents downloaded by the previous step and emit it as USDM v3.0.0 metadata.\n\n# 1. Find the source documents\n\nThe `fetch-documents` step downloaded every document ClinicalTrials.gov posted for this study and committed them into the run workspace. Their metadata is in your Input Data under `steps['fetch-documents'].documents[]` — each entry has `filename`, `typeAbbrev`, `label`, `date`, `sizeBytes`.\n\nLocate the actual PDF bytes FIRST, before any other work:\n\n```\nfind /workspace /data -name '*.pdf' 2>/dev/null\n```\n\nThey are expected under `/workspace/.mediforce/output/fetch-documents/`.\n\nIf that finds no PDF, STOP. Write to /output/result.json:\n`{\"error\": \"no source PDFs found\", \"searched\": [\"/workspace\", \"/data\"], \"workspaceListing\": \"<output of: ls -R /workspace | head -200>\"}`\nand make that file your result. Do NOT fabricate USDM content from the ClinicalTrials.gov metadata in your Input Data — an empty-handed failure with a directory listing is far more useful than invented study data.\n\nClassify the documents by `typeAbbrev`:\n- `Prot` — study protocol. PRIMARY source.\n- `Prot_SAP` — combined protocol + SAP. PRIMARY source.\n- `SAP` — statistical analysis plan. Secondary: objectives, endpoints, estimands, analysis populations.\n- `ICF` — informed consent form. Lowest priority; eligibility wording only, and only if the protocol is unusable.\n\n# 2. Extract text\n\n```\npdftotext -layout <pdf> /output/<basename>.txt\n```\n\n`-layout` preserves table structure, which the arms / epochs / schedule-of-activities tables depend on. Protocols run 100–300 pages: do NOT read a whole file linearly. Grep for section headings and read the sections you need — title page, synopsis or protocol summary, objectives and endpoints, study design and schema, eligibility criteria, study treatments / interventions, schedule of activities.\n\nRecord the 1-based PDF page number for everything you extract. `pdftotext` emits form feeds (\\f) between pages, so page N is the Nth form-feed-delimited block.\n\n# 3. Build the USDM JSON\n\nTarget **USDM v3.0.0**. Keep real USDM class and attribute names. Write this envelope to `usdm.json`:\n\n```json\n{\n  \"usdmVersion\": \"3.0.0\",\n  \"systemName\": \"mediforce simple-workflow generate-usdm\",\n  \"study\": {\n    \"id\": \"Study_1\",\n    \"name\": \"<sponsor protocol number, or the NCT id if none>\",\n    \"label\": \"<brief title>\",\n    \"description\": \"<1-3 sentence description>\",\n    \"versions\": [\n      {\n        \"id\": \"StudyVersion_1\",\n        \"versionIdentifier\": \"<protocol version / amendment number from the title page>\",\n        \"rationale\": \"<why this version exists, if the document states it; else null>\",\n        \"titles\": [\n          { \"id\": \"StudyTitle_1\", \"text\": \"<verbatim official title>\", \"type\": { \"id\": \"Code_1\", \"code\": \"C207616\", \"codeSystem\": \"http://www.cdisc.org\", \"codeSystemVersion\": null, \"decode\": \"Official Study Title\" } }\n        ],\n        \"studyIdentifiers\": [\n          { \"id\": \"StudyIdentifier_1\", \"studyIdentifier\": \"<NCT id>\", \"studyIdentifierScope\": { \"id\": \"Organization_1\", \"name\": \"ClinicalTrials.gov\", \"type\": { \"id\": \"Code_2\", \"code\": \"C93453\", \"codeSystem\": \"http://www.cdisc.org\", \"codeSystemVersion\": null, \"decode\": \"Study Registry\" } } }\n        ],\n        \"studyType\": { \"...Code...\": \"Interventional or Observational\" },\n        \"studyPhase\": { \"...AliasCode wrapping a Code...\": \"e.g. C15602 / Phase III Trial\" },\n        \"businessTherapeuticAreas\": [],\n        \"studyDesigns\": [\n          {\n            \"id\": \"StudyDesign_1\",\n            \"name\": \"<short design name>\",\n            \"label\": \"<design label>\",\n            \"description\": \"<the design sentence from the synopsis>\",\n            \"studyType\": \"<Code>\",\n            \"therapeuticAreas\": [],\n            \"interventionModel\": \"<Code: Parallel / Crossover / Single Group / Factorial>\",\n            \"blindingSchema\": \"<AliasCode: Open Label / Double Blind / ...>\",\n            \"trialIntentTypes\": [],\n            \"trialTypes\": [],\n            \"arms\": [ { \"id\": \"Arm_1\", \"name\": \"...\", \"label\": \"...\", \"description\": \"...\", \"type\": \"<Code: Experimental / Placebo Comparator / ...>\", \"dataOriginDescription\": null, \"dataOriginType\": null } ],\n            \"epochs\": [ { \"id\": \"Epoch_1\", \"name\": \"Screening\", \"label\": \"...\", \"description\": \"...\", \"type\": \"<Code>\", \"previousId\": null, \"nextId\": \"Epoch_2\" } ],\n            \"elements\": [ { \"id\": \"StudyElement_1\", \"name\": \"...\", \"label\": \"...\", \"description\": \"...\" } ],\n            \"studyCells\": [ { \"id\": \"StudyCell_1\", \"armId\": \"Arm_1\", \"epochId\": \"Epoch_1\", \"elementIds\": [\"StudyElement_1\"] } ],\n            \"objectives\": [\n              { \"id\": \"Objective_1\", \"name\": \"Primary Objective 1\", \"description\": \"...\", \"text\": \"<verbatim>\", \"level\": \"<Code: Primary / Secondary / Exploratory>\",\n                \"endpoints\": [ { \"id\": \"Endpoint_1_1\", \"name\": \"...\", \"text\": \"<verbatim>\", \"purpose\": \"...\", \"level\": \"<Code>\" } ] }\n            ],\n            \"population\": { \"id\": \"StudyDesignPopulation_1\", \"name\": \"...\", \"description\": \"...\", \"plannedEnrollmentNumber\": { \"minValue\": null, \"maxValue\": null }, \"plannedSex\": [], \"plannedAge\": null, \"criterionIds\": [\"EligibilityCriterion_1\"] },\n            \"eligibilityCriteria\": [ { \"id\": \"EligibilityCriterion_1\", \"name\": \"INCL 1\", \"label\": \"...\", \"identifier\": \"1\", \"category\": \"<Code: Inclusion / Exclusion>\", \"text\": \"<verbatim criterion text>\" } ],\n            \"studyInterventions\": [ { \"id\": \"StudyIntervention_1\", \"name\": \"...\", \"label\": \"...\", \"description\": \"...\", \"role\": \"<Code>\", \"type\": \"<Code: Drug / Device / Procedure / ...>\", \"minimumResponseDuration\": null, \"codes\": [] } ],\n            \"encounters\": [],\n            \"activities\": []\n          }\n        ]\n      }\n    ],\n    \"documentedBy\": [ { \"id\": \"StudyDefinitionDocument_1\", \"name\": \"...\", \"label\": \"<source PDF filename>\", \"type\": \"<Code: Protocol / Statistical Analysis Plan / Informed Consent>\", \"language\": \"en\" } ]\n  }\n}\n```\n\nEvery `Code` is `{ \"id\", \"code\", \"codeSystem\", \"codeSystemVersion\", \"decode\" }`. An `AliasCode` is `{ \"id\", \"standardCode\": <Code> }`.\n\nRules that are not negotiable:\n\n1. **Never invent content.** Every `text`, `description`, and `name` must come from the source documents. If the protocol does not state something, set it to `null` and add an entry to `unresolved` in result.json. A sparse-but-true USDM beats a full-but-fabricated one, and the reviewer's job is to catch exactly this.\n2. **Codes:** use the real CDISC CT code when you are confident of it (e.g. `C15602` = Phase III Trial, `C98388` = Interventional Study). When you are not confident, set `\"code\": null` and keep `\"decode\"` as the verbatim source wording, then add an `unresolved` entry. Do not guess code values.\n3. **Referential integrity:** every `armId`, `epochId`, `elementIds[]`, and `criterionIds[]` must resolve to an `id` you actually declared. Before writing the file, verify this — walk the reference fields and check each target exists. State the result in result.json's `integrityCheck`.\n4. **Epoch chaining:** `previousId` / `nextId` must form one consistent chain across `epochs` in study order.\n5. **studyCells** is the arm × epoch matrix. Emit one cell per (arm, epoch) pair the design actually uses, not the full cross product if the design does not use it.\n6. `activities` and `encounters` (the schedule of activities) are BEST EFFORT. Populate them only if the SoA table extracted legibly. If it did not, leave both as `[]` and add an `unresolved` entry saying so — do not reconstruct a schedule from prose.\n\n# 4. Traceability\n\nWrite `usdm-provenance.json`:\n\n```json\n{ \"nctId\": \"...\",\n  \"entries\": [ { \"path\": \"study.versions[0].titles[0].text\", \"sourceFile\": \"NCT..._Prot_000.pdf\", \"page\": 1, \"quote\": \"<short verbatim quote, <= 200 chars>\" } ] }\n```\n\nProvenance is REQUIRED for: every title, every studyIdentifier, studyType, studyPhase, interventionModel, blindingSchema, every arm, every epoch, every objective, every endpoint, and every eligibility criterion. It is optional elsewhere.\n\n# 5. Reviewer summary\n\nWrite `usdm-summary.md` — what a reviewer reads to decide approve vs revise. Include: the study title and phase; a table of arms; the epoch chain; a table of objectives with their endpoints; inclusion/exclusion criteria counts with the first few of each; what you could NOT resolve and why; and your confidence with its rationale. Keep it skimmable — this is a review aid, not a reproduction of usdm.json.\n\n# 6. Revise re-entry\n\nIf `steps['review-usdm']` is present in your Input Data, this is a revision. Read `steps['review-usdm'].comment` (and `reviewerCallToAction` if present) — that comment is the source of truth for this iteration. Correct ONLY the items the reviewer flagged, keep everything else stable, and add a `revisionLog` array to result.json recording `{ \"comment\": \"...\", \"changed\": [\"<path>\", ...] }`. Do not return the prior iteration unchanged.\n\n# OUTPUT CONTRACT (MANDATORY)\n\nWrite all three deliverables to BOTH locations — `/workspace/usdm/` is committed to the run branch, `/output/` is what surfaces as this step's Output Files in the run UI:\n\n```\nmkdir -p /workspace/usdm\n# write usdm.json, usdm-provenance.json, usdm-summary.md into /workspace/usdm/\ncp /workspace/usdm/usdm.json /workspace/usdm/usdm-provenance.json /workspace/usdm/usdm-summary.md /output/\n```\n\nThen write `/output/result.json` — this is the step's output value, so keep it small (no USDM payload inside it):\n\n```json\n{\n  \"nctId\": \"NCT...\",\n  \"usdmVersion\": \"3.0.0\",\n  \"studyTitle\": \"<official title>\",\n  \"studyPhase\": \"<decode, e.g. Phase III Trial>\",\n  \"sourceDocuments\": [ { \"filename\": \"...\", \"typeAbbrev\": \"Prot\", \"pages\": 214, \"usedAs\": \"primary\" } ],\n  \"counts\": { \"titles\": 0, \"studyIdentifiers\": 0, \"arms\": 0, \"epochs\": 0, \"elements\": 0, \"studyCells\": 0, \"objectives\": 0, \"endpoints\": 0, \"inclusionCriteria\": 0, \"exclusionCriteria\": 0, \"studyInterventions\": 0, \"activities\": 0 },\n  \"integrityCheck\": { \"passed\": true, \"danglingReferences\": [] },\n  \"unresolved\": [ { \"path\": \"study.versions[0].studyDesigns[0].activities\", \"reason\": \"SoA table did not extract legibly from the scanned appendix\" } ],\n  \"outputFiles\": [\"usdm.json\", \"usdm-provenance.json\", \"usdm-summary.md\"],\n  \"confidence\": 0.0,\n  \"confidence_rationale\": \"...\",\n  \"summary\": \"<one line>\"\n}\n```\n\nYour FINAL message must be ONLY this, with no other text:\n`{\"output_file\": \"/output/result.json\", \"summary\": \"<one line>\"}`"
+      }
+    },
+    {
+      "id": "review-usdm",
+      "name": "Review USDM Metadata",
+      "type": "review",
+      "executor": "human",
+      "allowedRoles": ["operator"],
+      "description": "Review the extracted USDM metadata. Read usdm-summary.md first, then spot-check usdm.json against usdm-provenance.json — every title, phase, arm, epoch, objective, endpoint and eligibility criterion carries a source file and page number. Check the `unresolved` list in the step output for what the agent could not find. Approve to finish, or request changes to send the run back to Generate USDM Metadata with your comment.",
+      "params": [
+        {
+          "name": "comment",
+          "type": "string",
+          "required": false,
+          "requiredForVerdicts": ["revise"],
+          "description": "What to fix in the USDM metadata (required when requesting changes). Be specific about paths, e.g. \"arms are wrong — the protocol has 3 arms, see page 24\"."
+        }
+      ],
+      "verdicts": {
+        "approve": {
+          "target": "done",
+          "label": "Approve USDM",
+          "intent": "success"
+        },
+        "revise": {
+          "target": "generate-usdm",
+          "label": "Request Changes",
+          "intent": "warning",
+          "requiresComment": true
+        }
+      }
+    },
+    {
       "id": "done",
       "name": "Done",
       "type": "terminal",
@@ -59,6 +111,9 @@
   ],
   "transitions": [
     { "from": "select-study", "to": "fetch-documents" },
-    { "from": "fetch-documents", "to": "done" }
+    { "from": "fetch-documents", "to": "generate-usdm" },
+    { "from": "generate-usdm", "to": "review-usdm" },
+    { "from": "review-usdm", "to": "done" },
+    { "from": "review-usdm", "to": "generate-usdm" }
   ]
 }
